@@ -19,6 +19,7 @@ make vet
 make test
 make race
 make public-check
+make public-check-selftest
 make check
 ```
 
@@ -49,8 +50,11 @@ The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
 milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.md).
 
-`make public-check` scans tracked and non-ignored intended files for high-risk
-artifact names and credential/private-key signatures. It reports filenames and
-categories only, never matching contents. Local environment files, keys,
+`make public-check` scans every commit reachable from the current `HEAD`,
+stage-zero index blobs, and current tracked/non-ignored intended files for
+high-risk artifact names and credential/private-key signatures. It reports
+filenames and categories only, never matching contents. `make
+public-check-selftest` exercises binary data, reachable-history/index coverage,
+path rules, and fail-closed enumeration. Local environment files, keys,
 credentials, and secret/private directories are ignored by default; committed
 configuration must use a safe example file instead.

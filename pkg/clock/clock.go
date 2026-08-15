@@ -71,7 +71,7 @@ func (c *Manual) Advance(duration time.Duration) {
 		if timer.active && !timer.deadline.After(c.now) {
 			timer.active = false
 			delete(c.timers, timer)
-			timer.deliverLocked(c.now)
+			timer.deliverLocked(timer.deadline)
 		}
 	}
 }
@@ -101,24 +101,40 @@ type manualTimer struct {
 	ch       chan time.Time
 	deadline time.Time
 	active   bool
+	pending  bool
 }
 
 func (t *manualTimer) C() <-chan time.Time { return t.ch }
 
-// deliverLocked enforces the invariant that an active timer's one-slot
-// channel is empty before delivery. A full channel means a timer tick would be
-// silently dropped, so fail loudly while the owning clock lock is held.
+// deliverLocked records delivery under the clock lock. A full channel means a
+// timer tick would be silently dropped, so fail loudly while the owning clock
+// lock is held. pending remains true until Stop or Reset acknowledges the
+// expiration; those methods drain an unread tick without relying on len as
+// the source of truth.
 func (t *manualTimer) deliverLocked(now time.Time) {
+	if t.pending {
+		panic("clock: timer pending-delivery invariant violated")
+	}
 	select {
 	case t.ch <- now:
 	default:
 		panic("clock: timer channel invariant violated")
 	}
+	t.pending = true
 }
 
-func (t *manualTimer) requireEmptyLocked() {
-	if len(t.ch) != 0 {
-		panic("clock: active timer channel invariant violated")
+func (t *manualTimer) acknowledgePendingLocked() bool {
+	if !t.pending {
+		return false
+	}
+	t.pending = false
+	select {
+	case <-t.ch:
+		return true
+	default:
+		// The consumer already read the delivered tick. The pending state
+		// still prevented a second delivery until this acknowledgement.
+		return false
 	}
 }
 
@@ -126,9 +142,11 @@ func (t *manualTimer) Stop() bool {
 	t.clock.mu.Lock()
 	defer t.clock.mu.Unlock()
 	if !t.active {
-		return false
+		return t.acknowledgePendingLocked()
 	}
-	t.requireEmptyLocked()
+	if t.pending {
+		panic("clock: active timer pending-delivery invariant violated")
+	}
 	t.active = false
 	delete(t.clock.timers, t)
 	return true
@@ -138,15 +156,13 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 	t.clock.mu.Lock()
 	defer t.clock.mu.Unlock()
 	wasActive := t.active
-	if wasActive {
-		t.requireEmptyLocked()
-	} else {
-		// Match the useful part of time.Timer's reset contract for this
-		// deterministic implementation: discard an already queued event.
-		select {
-		case <-t.ch:
-		default:
-		}
+	if t.active && t.pending {
+		panic("clock: active timer pending-delivery invariant violated")
+	}
+	if !t.active && t.pending {
+		// An unread expiration counts as previously active. A consumed
+		// expiration is acknowledged without changing that result.
+		wasActive = t.acknowledgePendingLocked()
 	}
 	delete(t.clock.timers, t)
 	t.deadline = t.clock.now.Add(duration)

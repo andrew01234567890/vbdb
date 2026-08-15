@@ -13,9 +13,15 @@ replace. `If-Match: "<uuidv7>"` is an optional exact version precondition;
 
 Search is exclusively `QUERY /{table}` with media type
 `application/vnd.vbdb.query+json`; there is no POST or GET search fallback.
-Successful queries return 200, require a usable READY index, use opaque
-logical cursors, and return 422 when no index can satisfy the request.
-Responses carry row versions and `Cache-Control: no-store`. Errors use
+VBDB follows [RFC 10008](https://www.rfc-editor.org/rfc/rfc10008.html): QUERY
+is safe and idempotent, requires this request `Content-Type`, and advertises
+support with the Structured Field `Accept-Query: "application/vnd.vbdb.query+json"`
+response header. Successful queries return 200, use one global post-invocation
+HLC statement snapshot across all participating ranges and cursor pages, require
+a usable READY index, and return 422 when no index can satisfy the request.
+Opaque cursors bind the immutable snapshot timestamp and generation set.
+VBDB retains `Cache-Control: no-store` as policy even though RFC 10008 permits
+QUERY caching. Responses carry row versions. Errors use
 `application/problem+json` with stable error codes.
 
 Transactions use `POST /transactions/create`, `POST /transactions/commit`,
@@ -32,6 +38,16 @@ state is `EXPIRED`. A durable `COMMITTED` or `ROLLED_BACK` state recorded before
 the deadline wins over a later wall-clock expiry; retrying the same terminal
 operation then returns 200. A durable `COMMITTED` decision can win only when
 recorded before the deadline; otherwise the replicated expiry state wins.
+Each terminal decision entry carries a timestamp from a replicated/quorum-
+derived monotonic HLC authority. The quorum time service supplies a replicated
+uncertainty interval `[earliest, latest]` guaranteed to contain cluster time
+under the declared maximum skew bound. `COMMITTED` may be chosen only when
+`latest < deadline`; `EXPIRED` may be chosen only when `earliest >= deadline`.
+If the interval straddles the deadline or the bound is unavailable, the state
+stays `OPEN` and the request returns retryable 503 until the authority
+recovers. The interval evidence, deadline comparison, and terminal state are
+one consensus transition; no replica uses local apply-time wall clock. Expiry
+becomes authoritative only after an `EXPIRED` entry is applied.
 Creation returns 201, a committed or rolled-back operation is 200, and an
 unknown transaction is 404. Repeating the same terminal operation is
 idempotent; a conflicting terminal operation returns 409 and leaves the

@@ -27,6 +27,56 @@ func TestManualTimerFiresAtDeadline(t *testing.T) {
 	}
 }
 
+func TestManualTimerOvershootDeliversDeadline(t *testing.T) {
+	start := time.Unix(100, 0)
+	c := NewManual(start)
+	timer := c.NewTimer(5 * time.Second)
+	c.Advance(10 * time.Second)
+	select {
+	case got := <-timer.C():
+		want := start.Add(5 * time.Second)
+		if !got.Equal(want) {
+			t.Fatalf("timer fired at %s, want deadline %s", got, want)
+		}
+	default:
+		t.Fatal("timer did not fire after clock overshoot")
+	}
+}
+
+func TestManualStopDrainsUnreadPendingTick(t *testing.T) {
+	c := NewManual(time.Unix(100, 0))
+	timer := c.NewTimer(time.Second)
+	c.Advance(10 * time.Second)
+	if !timer.Stop() {
+		t.Fatal("Stop reported false for an unread fired timer")
+	}
+	select {
+	case <-timer.C():
+		t.Fatal("Stop left the pending tick queued")
+	default:
+	}
+}
+
+func TestManualResetDrainsUnreadPendingTick(t *testing.T) {
+	start := time.Unix(100, 0)
+	c := NewManual(start)
+	timer := c.NewTimer(time.Second)
+	c.Advance(10 * time.Second)
+	if !timer.Reset(2 * time.Second) {
+		t.Fatal("Reset did not report the unread expiration as previously active")
+	}
+	c.Advance(2 * time.Second)
+	select {
+	case got := <-timer.C():
+		want := start.Add(12 * time.Second)
+		if !got.Equal(want) {
+			t.Fatalf("reset timer fired at %s, want %s", got, want)
+		}
+	default:
+		t.Fatal("reset timer did not fire")
+	}
+}
+
 func TestManualStopAndReset(t *testing.T) {
 	c := NewManual(time.Unix(0, 0))
 	timer := c.NewTimer(time.Second)

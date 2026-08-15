@@ -87,6 +87,28 @@ func TestAcceptsPairedSurrogatesDeterministically(t *testing.T) {
 	}
 }
 
+func TestPreservesNumericTokenSpellings(t *testing.T) {
+	spellings := []string{"1", "1.0", "1e0", "-0", "1E+2"}
+	canonical := make([]string, len(spellings))
+	for i, spelling := range spellings {
+		got, err := Canonicalize([]byte(spelling))
+		if err != nil {
+			t.Fatalf("Canonicalize(%q): %v", spelling, err)
+		}
+		canonical[i] = string(got)
+		if canonical[i] != spelling {
+			t.Errorf("Canonicalize(%q) = %q, want exact spelling", spelling, canonical[i])
+		}
+	}
+	for i := range canonical {
+		for j := i + 1; j < len(canonical); j++ {
+			if canonical[i] == canonical[j] {
+				t.Errorf("canonical spellings %q and %q unexpectedly equal", spellings[i], spellings[j])
+			}
+		}
+	}
+}
+
 func TestCanonicalBytesAreIndependentCopies(t *testing.T) {
 	canonical, err := Canonicalize([]byte(`{"a":1}`))
 	if err != nil {

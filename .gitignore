@@ -32,4 +32,4 @@ private/
 .claude/
 .aws/
 .ssh/
-.kube/config
+.kube/
