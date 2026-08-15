@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -28,3 +30,5 @@ jobs:
         run: make public-check
       - name: Public-repository safety self-test
         run: make public-check-selftest
+      - name: Diff check
+        run: make diff-check

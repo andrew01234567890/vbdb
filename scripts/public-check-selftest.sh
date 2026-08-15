@@ -2,12 +2,15 @@
 # Exercise public-check with an untracked temporary fixture. The fixture is
 # removed on every exit path and its synthetic marker is never printed.
 set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d "$root/.public-check-selftest.XXXXXX")
 broken_index=$(mktemp "$root/.public-check-broken-index.XXXXXX")
 isolated=$(mktemp -d "$root/.public-check-isolated.XXXXXX")
 clean_repo=$(mktemp -d "$root/.public-check-clean.XXXXXX")
+replace_repo=$(mktemp -d "$root/.public-check-replace.XXXXXX")
+shallow_repo=$(mktemp -d "$root/.public-check-shallow.XXXXXX")
 empty_repo=$(mktemp -d "$root/.public-check-empty.XXXXXX")
 history_repo=$(mktemp -d "$root/.public-check-history.XXXXXX")
 staged_repo=$(mktemp -d "$root/.public-check-staged.XXXXXX")
@@ -16,6 +19,8 @@ cleanup() {
 	rm -f -- "$broken_index"
 	rm -rf -- "$isolated"
 	rm -rf -- "$clean_repo"
+	rm -rf -- "$replace_repo"
+	rm -rf -- "$shallow_repo"
 	rm -rf -- "$empty_repo"
 	rm -rf -- "$history_repo"
 	rm -rf -- "$staged_repo"
@@ -37,11 +42,18 @@ ghs_token=$(printf '%s%s%s' 'gh' 's_' "$token_suffix")
 ghr_token=$(printf '%s%s%s' 'gh' 'r_' "$token_suffix")
 pgp_header=$(printf '%s%s%s%s' '-----BEGIN ' 'PGP ' 'PRIVATE KEY ' 'BLOCK-----')
 encrypted_header=$(printf '%s%s%s' '-----BEGIN ' 'ENCRYPTED ' 'PRIVATE KEY-----')
+pkcs8_header=$(printf '%s%s%s' '-----BEGIN ' 'PRIVATE KEY' '-----')
+bash_version_helper=$(sed -n '/^require_bash4()/,/^}/p' "$root/scripts/public-check.sh")
+if [ -z "$bash_version_helper" ] || bash -c "$bash_version_helper; require_bash4 3" >/dev/null 2>&1 || ! bash -c "$bash_version_helper; require_bash4 4"; then
+	printf '%s\n' 'public-check-selftest: Bash-version guard regression' >&2
+	exit 1
+fi
 printf '%s%s\n' "$marker_prefix" "$marker_suffix" > "$fixture/fixture.txt"
-printf 'prefix\0%s%s\0suffix\n' "$marker_prefix" "$marker_suffix" > "$fixture/fixture.bin"
+printf 'prefix\0%s%s\0%s\0suffix\n' "$marker_prefix" "$marker_suffix" "$pkcs8_header" > "$fixture/fixture.bin"
 mkdir -p "$fixture/forms"
 printf '%s\n' "$pgp_header" > "$fixture/forms/pgp.txt"
 printf '%s\n' "$encrypted_header" > "$fixture/forms/encrypted.txt"
+printf '%s\n' "$pkcs8_header" > "$fixture/forms/pkcs8.txt"
 printf '%s\n' "$ghp_token" > "$fixture/forms/ghp.txt"
 printf '%s\n' "$gho_token" > "$fixture/forms/gho.txt"
 printf '%s\n' "$ghu_token" > "$fixture/forms/ghu.txt"
@@ -63,7 +75,7 @@ case "$output" in
 		printf '%s\n' 'public-check-selftest: detector did not report the fixture path' >&2
 		exit 1
 		;;
-esac
+	esac
 case "$output" in
 	*fixture.bin*) ;;
 	*)
@@ -71,7 +83,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for form in pgp encrypted ghp gho ghu ghs ghr; do
+for form in pgp encrypted pkcs8 ghp gho ghu ghs ghr; do
 	case "$output" in
 		*"forms/$form.txt"*) ;;
 		*)
@@ -86,7 +98,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
+for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$pkcs8_header" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
 	case "$output" in
 		*"$secret"*)
 			printf '%s\n' 'public-check-selftest: detector leaked fixture contents' >&2
@@ -120,7 +132,7 @@ esac
 
 mkdir -p "$history_repo/scripts"
 cp "$root/scripts/public-check.sh" "$history_repo/scripts/public-check.sh"
-printf '%s%s\n' "$marker_prefix" "$marker_suffix" > "$history_repo/history.txt"
+printf '%s%s\n%s\n' "$marker_prefix" "$marker_suffix" "$pkcs8_header" > "$history_repo/history.txt"
 mkdir -p "$history_repo/secrets"
 printf '%s\n' 'safe historical filename fixture' > "$history_repo/secrets/old.txt"
 git -C "$history_repo" init -q
@@ -137,8 +149,9 @@ git -C "$history_repo" checkout -q -b unpublished-secret
 git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit --allow-empty -qm "branch-only $ghs_token"
 branch_commit=$(git -C "$history_repo" rev-parse HEAD)
 git -C "$history_repo" checkout -q "$base_branch"
-git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid tag -a tag-secret -m "tag-only $ghr_token"
-tag_object=$(git -C "$history_repo" rev-parse 'refs/tags/tag-secret^{tag}')
+secret_tag_name=$(printf '%s%s%s' 'gh' 'p_' "$token_suffix")
+git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid tag -a "$secret_tag_name" -m "tag-only $ghr_token $pkcs8_header"
+tag_object=$(git -C "$history_repo" rev-parse "refs/tags/$secret_tag_name^{tag}")
 set +e
 output=$("$history_repo/scripts/public-check.sh" 2>&1)
 check_status=$?
@@ -169,7 +182,7 @@ case "$output" in
 		;;
 esac
 case "$output" in
-	*"TAG:REF:refs/tags/tag-secret:$tag_object"*) ;;
+	*"TAG:$tag_object"*) ;;
 	*)
 		printf '%s\n' 'public-check-selftest: annotated tag message was not scanned' >&2
 		exit 1
@@ -182,7 +195,20 @@ case "$output" in
 		exit 1
 		;;
 esac
-for secret in "$marker_prefix$marker_suffix" "$gho_token" "$ghs_token" "$ghr_token"; do
+case "$output" in
+	*"REF:$tag_object"*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: credential-shaped ref name was not rejected' >&2
+		exit 1
+		;;
+esac
+case "$output" in
+	*"refs/tags/$secret_tag_name"*)
+		printf '%s\n' 'public-check-selftest: raw credential-shaped ref name leaked' >&2
+		exit 1
+		;;
+esac
+for secret in "$marker_prefix$marker_suffix" "$pkcs8_header" "$gho_token" "$ghs_token" "$ghr_token" "$secret_tag_name"; do
 	case "$output" in
 		*"$secret"*)
 			printf '%s\n' 'public-check-selftest: committed fixture contents leaked' >&2
@@ -190,6 +216,69 @@ for secret in "$marker_prefix$marker_suffix" "$gho_token" "$ghs_token" "$ghr_tok
 			;;
 	esac
 done
+
+mkdir -p "$replace_repo/scripts"
+cp "$root/scripts/public-check.sh" "$replace_repo/scripts/public-check.sh"
+printf '%s\n' 'clean child fixture' > "$replace_repo/data.txt"
+git -C "$replace_repo" init -q
+git -C "$replace_repo" add scripts/public-check.sh data.txt
+git -C "$replace_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm initial
+base_commit=$(git -C "$replace_repo" rev-parse HEAD)
+printf '%s\n' 'secret child fixture' > "$replace_repo/data.txt"
+git -C "$replace_repo" add data.txt
+git -C "$replace_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit --allow-empty -qm "$marker_prefix$marker_suffix"
+secret_commit=$(git -C "$replace_repo" rev-parse HEAD)
+printf '%s\n' 'clean child fixture' > "$replace_repo/data.txt"
+git -C "$replace_repo" add data.txt
+git -C "$replace_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm clean
+base_tree=$(git -C "$replace_repo" rev-parse "$base_commit^{tree}")
+clean_replacement=$(printf '%s\n' 'clean replacement object' | git -C "$replace_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit-tree "$base_tree" -p "$base_commit")
+git -C "$replace_repo" replace "$secret_commit" "$clean_replacement"
+if ! git -C "$replace_repo" replace -l | grep -F -q -- "$secret_commit"; then
+	printf '%s\n' 'public-check-selftest: replace ref was not installed' >&2
+	exit 1
+fi
+set +e
+output=$(GIT_NO_REPLACE_OBJECTS=0 "$replace_repo/scripts/public-check.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -eq 0 ]; then
+	printf '%s\n' 'public-check-selftest: replace-object history was not rejected' >&2
+	exit 1
+fi
+case "$output" in
+	*"COMMIT:HISTORY:$secret_commit"*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: original replaced commit was not scanned' >&2
+		exit 1
+		;;
+esac
+case "$output" in
+	*"$marker_prefix$marker_suffix"*)
+		printf '%s\n' 'public-check-selftest: replace-object fixture contents leaked' >&2
+		exit 1
+		;;
+esac
+
+if ! git clone -q --depth=1 "file://$history_repo" "$shallow_repo"; then
+	printf '%s\n' 'public-check-selftest: unable to create shallow clone' >&2
+	exit 1
+fi
+set +e
+output=$("$shallow_repo/scripts/public-check.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -ne 2 ]; then
+	printf 'public-check-selftest: shallow repository status = %s, want 2\n' "$check_status" >&2
+	exit 1
+fi
+case "$output" in
+	*shallow*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: shallow repository was not rejected' >&2
+		exit 1
+		;;
+esac
 
 mkdir -p "$clean_repo/scripts" "$clean_repo/docs"
 cp "$root/scripts/public-check.sh" "$clean_repo/scripts/public-check.sh"
@@ -214,7 +303,7 @@ esac
 
 mkdir -p "$staged_repo/scripts"
 cp "$root/scripts/public-check.sh" "$staged_repo/scripts/public-check.sh"
-printf '%s%s\n' "$marker_prefix" "$marker_suffix" > "$staged_repo/staged.txt"
+printf '%s%s\n%s\n' "$marker_prefix" "$marker_suffix" "$pkcs8_header" > "$staged_repo/staged.txt"
 git -C "$staged_repo" init -q
 git -C "$staged_repo" add scripts/public-check.sh staged.txt
 rm -f -- "$staged_repo/staged.txt"
@@ -233,20 +322,27 @@ case "$output" in
 		exit 1
 		;;
 esac
-case "$output" in
-	*"$marker_prefix$marker_suffix"*)
-		printf '%s\n' 'public-check-selftest: staged fixture contents leaked' >&2
-		exit 1
-		;;
-esac
+for secret in "$marker_prefix$marker_suffix" "$pkcs8_header"; do
+	case "$output" in
+		*"$secret"*)
+			printf '%s\n' 'public-check-selftest: staged fixture contents leaked' >&2
+			exit 1
+			;;
+	esac
+done
 
 mkdir -p "$isolated/scripts"
 cp "$root/scripts/public-check.sh" "$isolated/scripts/public-check.sh"
 mkdir -p "$isolated/deploy/.kube"
 printf '%s\n' 'safe fixture' > "$isolated/deploy/.kube/config"
 printf '%s\n' 'safe fixture' > "$isolated/id_rsa"
+mkdir -p "$isolated/Deploy/.KUBE" "$isolated/PRIVATE"
+printf '%s\n' 'safe fixture' > "$isolated/Deploy/.KUBE/Config"
+printf '%s\n' 'safe fixture' > "$isolated/ID_RSA"
+printf '%s\n' 'safe fixture' > "$isolated/Secrets"
+printf '%s\n' 'safe fixture' > "$isolated/PRIVATE/Thing"
 git -C "$isolated" init -q
-git -C "$isolated" add scripts/public-check.sh deploy/.kube/config id_rsa
+git -C "$isolated" add scripts/public-check.sh deploy/.kube/config id_rsa Deploy/.KUBE/Config ID_RSA Secrets PRIVATE/Thing
 printf '\n# %s%s\n' "$marker_prefix" "$marker_suffix" >> "$isolated/scripts/public-check.sh"
 set +e
 output=$("$isolated/scripts/public-check.sh" 2>&1)
@@ -277,6 +373,15 @@ case "$output" in
 		exit 1
 		;;
 esac
+for path in 'Deploy/.KUBE/Config' 'ID_RSA' 'Secrets' 'PRIVATE/Thing'; do
+	case "$output" in
+		*"$path"*) ;;
+		*)
+			printf 'public-check-selftest: mixed-case private path %s was not rejected\n' "$path" >&2
+			exit 1
+			;;
+	esac
+done
 case "$output" in
 	*"$marker_prefix$marker_suffix"*)
 		printf '%s\n' 'public-check-selftest: scanner source check leaked fixture contents' >&2

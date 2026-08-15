@@ -139,6 +139,7 @@ func FuzzTupleRoundTrip(f *testing.F) {
 func TestDecodeRejectsMalformedInput(t *testing.T) {
 	cases := [][]byte{
 		{}, {2, 0}, {1}, {1, byte(StringKind), 'a', 0},
+		{1, byte(StringKind), 0xff, 0, 0, 0},
 		{1, byte(StringKind), 0, 1}, {1, byte(BoolKind), 2, 0},
 		{1, 99, 0}, {1, byte(Uint64Kind), 0, 0}, {1, 0, 7},
 	}

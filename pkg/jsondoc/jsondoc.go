@@ -14,6 +14,8 @@ import (
 	"unicode/utf8"
 )
 
+// encoding/json currently rejects malformed number grammar while tokenizing;
+// retain this explicit regexp as defense in depth if decoder behavior changes.
 var numberPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
 
 // MaxDepth is the greatest number of nested JSON arrays or objects accepted

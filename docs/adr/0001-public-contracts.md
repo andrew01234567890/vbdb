@@ -48,17 +48,37 @@ stays `OPEN` and the request returns retryable 503 until the authority
 recovers. The interval evidence, deadline comparison, and terminal state are
 one consensus transition; no replica uses local apply-time wall clock. Expiry
 becomes authoritative only after an `EXPIRED` entry is applied.
+A client-requested `ROLLED_BACK` decision uses the same deadline authority:
+`latest < deadline` is required, `earliest >= deadline` chooses `EXPIRED`, and
+an interval that straddles the deadline or has no bound leaves the transaction
+`OPEN` with retryable 503. The comparison and terminal state are one consensus
+transition, so rollback after expiry cannot report success.
 Creation returns 201, a committed or rolled-back operation is 200, and an
 unknown transaction is 404. Repeating the same terminal operation is
 idempotent; a conflicting terminal operation returns 409 and leaves the
 recorded terminal state unchanged. `GET /transactions/{id}` always reports the
 recorded state, including `EXPIRED`.
 
+For a cross-shard commit, replicated participant prepare intents are installed
+only during commit, after OCC validation succeeds. Every participant must be
+prepared before one replicated transaction decision becomes the linearization
+point. While `OPEN`, staged data remains private and holds no locks or intents;
+prepare intents and short reservations exist only during commit. GET and QUERY
+that encounter an intent resolve it against the recorded decision: `COMMITTED`
+is visible atomically, while abort or `EXPIRED` intents are ignored and removed.
+Materialization lag cannot expose a cross-shard fracture. Recovery and failover
+replay the decision and intents before serving the same visibility rule; an
+unresolved prepare remains hidden and retryable.
+
 CDC uses `GET /_cdc` or `GET /_cdc/{table}` with `Accept: text/event-stream`.
-The stream returns 200 and events are committed logical transactions, globally
-ordered, at-least-once, and resumed with `Last-Event-ID`. Consumers deduplicate
-stable event IDs. `cdc.retention` defaults to 24 hours and a cursor older than
-retained history returns 410 with the earliest available position.
+The stream returns 200 and emits one event per committed logical transaction,
+at-least-once, and resumes with `Last-Event-ID`. A global HLC commit position
+plus stable transaction-ID tiebreak defines order. Each range persists progress
+and a closed watermark; the merger emits only through the global minimum
+watermark, so a slow range cannot be skipped. Consumers deduplicate stable
+event IDs. `cdc.retention` defaults to 24 hours and a cursor older than retained
+history returns 410 with the earliest available position. The ordering merger,
+watermarks, and journal are later-milestone mechanisms, not implemented here.
 
 `_admin`, `_cdc`, and `transactions` are reserved names. Authentication,
 authorization, TLS, schema administration, and actual route handlers are later

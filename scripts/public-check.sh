@@ -2,12 +2,40 @@
 # Check every byte source that a Git publication can carry. This intentionally
 # prints only paths and finding categories, never matched text.
 set -u
+export GIT_NO_REPLACE_OBJECTS=1
+
+require_bash4() {
+	local major=$1
+	if [ "$major" -lt 4 ]; then
+		printf '%s\n' 'public-check: Bash 4 or newer is required' >&2
+		return 1
+	fi
+}
+
+if ! require_bash4 "${BASH_VERSINFO[0]:-0}"; then
+	exit 2
+fi
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 	printf '%s\n' 'public-check: not inside a Git worktree' >&2
 	exit 2
 fi
+if ! shallow=$(git -C "$root" rev-parse --is-shallow-repository 2>/dev/null); then
+	printf '%s\n' 'public-check: unable to determine shallow-repository state' >&2
+	exit 2
+fi
+case "$shallow" in
+	true)
+		printf '%s\n' 'public-check: shallow repositories are not publishable' >&2
+		exit 2
+		;;
+	false) ;;
+	*)
+		printf '%s\n' 'public-check: invalid shallow-repository state' >&2
+		exit 2
+		;;
+esac
 
 history_manifest=
 tree_manifest=
@@ -62,20 +90,25 @@ private_word='PRIVATE KEY'
 private_key_pattern="${key_begin}(RSA|EC|OPENSSH|DSA) ${private_word}${key_end}"
 pgp_key_pattern="${key_begin}PGP ${private_word} BLOCK${key_end}"
 encrypted_key_pattern="${key_begin}ENCRYPTED ${private_word}${key_end}"
-credential_pattern="${private_key_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}"
+pkcs8_key_pattern="${key_begin}${private_word}${key_end}"
+credential_pattern="${private_key_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|${pkcs8_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}"
 
 # These are names, not content matches. Examples and source files remain
 # publishable, while common local credential and private-material paths do not.
 is_high_risk_name() {
-	local path=$1 base=${1##*/}
-	case "$path" in
+	local path=$1
+	local base=${path##*/}
+	local lower_path lower_base
+	lower_path=$(printf '%s' "$path" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+	lower_base=$(printf '%s' "$base" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+	case "$lower_path" in
 		secrets/*|private/*|credentials/*|.codex/*|.claude/*|.aws/*|.ssh/*|.kube/*|*/secrets/*|*/private/*|*/credentials/*|*/.codex/*|*/.claude/*|*/.aws/*|*/.ssh/*|*/.kube/*)
 			return 0
 			;;
 	esac
-	case "$base" in
-		.env|.env.*|*.pem|*.key|*.p12|*.pfx|*.jks|id_rsa|id_rsa.*|id_ed25519|id_ed25519.*|credentials|credentials.*|credentials.json|secret|secret.*)
-			[ "$base" != ".env.example" ]
+	case "$lower_base" in
+		.env|.env.*|*.pem|*.key|*.p12|*.pfx|*.jks|id_rsa|id_rsa.*|id_ed25519|id_ed25519.*|credentials|credentials.*|credentials.json|secret|secret.*|secrets|secrets.*)
+			[ "$lower_base" != ".env.example" ]
 			return
 			;;
 	esac
@@ -107,6 +140,12 @@ scan_blob() {
 		exit 2
 	fi
 	scan_content "$label" "$content_file"
+}
+
+scan_ref_name() {
+	local ref=$1 object_id=$2
+	printf '%s' "$ref" >"$content_file"
+	scan_content "REF:$object_id" "$content_file"
 }
 
 scan_tree() {
@@ -158,7 +197,7 @@ scan_object() {
 				report "TAG:$object_id" 'unable to read reachable tag object'
 				exit 2
 			fi
-			scan_content "TAG:$label:$object_id" "$object_file"
+			scan_content "TAG:$object_id" "$object_file"
 			while IFS= read -r line; do
 				case "$line" in
 					object\ *)
@@ -171,7 +210,7 @@ scan_object() {
 				esac
 			done <"$object_file"
 			if [ -z "$target" ]; then
-				report "TAG:$label:$object_id" 'malformed reachable tag object'
+				report "TAG:$object_id" 'malformed reachable tag object'
 				exit 2
 			fi
 			scan_object "$label" "$target"
@@ -224,7 +263,8 @@ while IFS= read -r -d '' ref; do
 		printf '%s\n' 'public-check: malformed refs enumeration' >&2
 		exit 2
 	fi
-	scan_object "REF:$ref" "$object_id"
+	scan_ref_name "$ref" "$object_id"
+	scan_object 'REF' "$object_id"
 done <"$refs_manifest"
 
 # Stage-zero index bytes are publishable. Any unresolved stage is rejected

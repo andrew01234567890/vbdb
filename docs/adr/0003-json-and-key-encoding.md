@@ -14,6 +14,9 @@ truncation, and trailing bytes.
 
 `pkg/jsondoc` parses with `json.Decoder.UseNumber`, rejects duplicate keys at
 any depth, invalid UTF-8, trailing values, and invalid/non-finite number forms.
+The explicit number regexp is intentional defense in depth: the current
+`encoding/json` decoder already prevalidates number grammar, but this package
+retains its own check at the token boundary.
 Container nesting is explicitly bounded at `MaxDepth` (128), before recursive
 canonicalization. Canonical output is compact JSON with deterministic
 object-key ordering and number tokens emitted without a float64 conversion,

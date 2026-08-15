@@ -12,16 +12,16 @@ func TestRegistryDisabledByDefaultAndExplicitlyInjectable(t *testing.T) {
 	if err := first.Register("before-commit"); err != nil {
 		t.Fatal(err)
 	}
-	if first.Hit("before-commit") {
+	if hit, err := first.Hit("before-commit"); err != nil || hit {
 		t.Fatal("new failpoint was enabled")
 	}
-	if second.Hit("before-commit") {
-		t.Fatal("registries leaked state")
+	if hit, err := second.Hit("before-commit"); !errors.Is(err, ErrUnknown) || hit {
+		t.Fatal("unknown failpoint did not report ErrUnknown")
 	}
 	if err := first.Enable("before-commit"); err != nil {
 		t.Fatal(err)
 	}
-	if !first.Hit("before-commit") {
+	if hit, err := first.Hit("before-commit"); err != nil || !hit {
 		t.Fatal("enabled failpoint did not report a hit")
 	}
 	hits, err := first.Hits("before-commit")
@@ -34,7 +34,7 @@ func TestRegistryDisabledByDefaultAndExplicitlyInjectable(t *testing.T) {
 	if err := first.Disable("before-commit"); err != nil {
 		t.Fatal(err)
 	}
-	if first.Hit("before-commit") {
+	if hit, err := first.Hit("before-commit"); err != nil || hit {
 		t.Fatal("disabled failpoint reported a hit")
 	}
 }
@@ -49,6 +49,9 @@ func TestRegistryRejectsUnknownAndEmptyNames(t *testing.T) {
 	}
 	if err := r.Disable("missing"); err == nil {
 		t.Fatal("unknown name accepted")
+	}
+	if hit, err := r.Hit("missing"); !errors.Is(err, ErrUnknown) || hit {
+		t.Fatalf("unknown Hit() = %t, %v; want false and ErrUnknown", hit, err)
 	}
 	if hits, err := r.Hits("missing"); !errors.Is(err, ErrUnknown) || hits != 0 {
 		t.Fatalf("unknown Hits() = %d, %v; want zero and ErrUnknown", hits, err)
@@ -78,7 +81,7 @@ func TestRegistryRaceSafe(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < hitsPerWorker; j++ {
 				_ = r.Enabled("io")
-				_ = r.Hit("io")
+				_, _ = r.Hit("io")
 			}
 		}()
 	}

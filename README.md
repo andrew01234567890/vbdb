@@ -20,6 +20,7 @@ make test
 make race
 make public-check
 make public-check-selftest
+make diff-check
 make check
 ```
 
@@ -56,6 +57,8 @@ blobs, and current tracked/non-ignored intended files for high-risk artifact
 names and credential/private-key signatures. It reports filenames and
 categories only, never matching contents. `make public-check-selftest`
 exercises binary data, ref/history/index coverage, commit/tag metadata, path
-rules, and fail-closed enumeration. Local environment files, keys,
-credentials, and secret/private directories are ignored by default; committed
-configuration must use a safe example file instead.
+rules, replace-object immunity, shallow-history rejection, and fail-closed
+enumeration. It requires a complete non-shallow history and disables Git
+replace refs while scanning. Local environment files, keys, credentials, and
+secret/private directories are ignored by default; committed configuration
+must use a safe example file instead.

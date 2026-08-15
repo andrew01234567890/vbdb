@@ -73,18 +73,22 @@ func (r *Registry) Enabled(name string) bool {
 	return ok && point.enabled
 }
 
-// Hit records and reports an enabled point. Callers decide how to inject the
-// failure (return an error, stop a worker, or pause a state machine); this
-// package never panics or changes control flow on their behalf.
-func (r *Registry) Hit(name string) bool {
+// Hit records and reports an enabled point. Unknown names return ErrUnknown;
+// registered but disabled points return (false, nil). Callers decide how to
+// inject the failure (return an error, stop a worker, or pause a state
+// machine); this package never panics or changes control flow on their behalf.
+func (r *Registry) Hit(name string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	point, ok := r.points[name]
-	if !ok || !point.enabled {
-		return false
+	if !ok {
+		return false, fmt.Errorf("%w %q", ErrUnknown, name)
+	}
+	if !point.enabled {
+		return false, nil
 	}
 	point.hits++
-	return true
+	return true, nil
 }
 
 func (r *Registry) Hits(name string) (uint64, error) {

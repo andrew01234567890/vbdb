@@ -65,8 +65,10 @@ is unavailable during a clock jump, leadership change, or failover, the state
 remains `OPEN` and the request returns retryable 503 until the authority
 recovers. The chosen interval evidence, deadline comparison, and terminal state
 are one consensus transition, retained for recovery and history checking; no
-replica uses local apply-time wall clock. These mechanisms are later milestones
-and are not implemented here.
+replica uses local apply-time wall clock. A client `ROLLED_BACK` decision also
+requires `latest < deadline`; `earliest >= deadline` chooses `EXPIRED`, while a
+straddling or unavailable interval leaves `OPEN` with retryable 503. These
+mechanisms are later milestones and are not implemented here.
 
 ## Not implemented in Milestone 1
 

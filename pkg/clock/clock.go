@@ -23,6 +23,9 @@ type Clock interface {
 	NewTimer(time.Duration) Timer
 }
 
+var _ Clock = Real{}
+var _ Clock = (*Manual)(nil)
+
 // Real is the production clock backed by the standard library.
 type Real struct{}
 
@@ -33,6 +36,9 @@ func (Real) NewTimer(duration time.Duration) Timer {
 }
 
 type realTimer struct{ timer *time.Timer }
+
+var _ Timer = realTimer{}
+var _ Timer = (*manualTimer)(nil)
 
 func (t realTimer) C() <-chan time.Time               { return t.timer.C }
 func (t realTimer) Stop() bool                        { return t.timer.Stop() }

@@ -6,6 +6,34 @@ import (
 	"time"
 )
 
+func TestRealClockNowTimerAndStop(t *testing.T) {
+	real := Real{}
+	before := time.Now()
+	now := real.Now()
+	after := time.Now()
+	if now.Before(before) || now.After(after) {
+		t.Fatalf("Real.Now() = %s, outside [%s, %s]", now, before, after)
+	}
+
+	timer := real.NewTimer(10 * time.Millisecond)
+	select {
+	case <-timer.C():
+		if timer.Stop() {
+			t.Fatal("Stop reported true after the timer value was received")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Real timer did not fire within the outer timeout")
+	}
+
+	stopped := real.NewTimer(time.Hour)
+	if !stopped.Stop() {
+		t.Fatal("Stop reported false for a running timer")
+	}
+	if stopped.Stop() {
+		t.Fatal("second Stop reported true")
+	}
+}
+
 func TestManualTimerFiresAtDeadline(t *testing.T) {
 	start := time.Unix(100, 0)
 	c := NewManual(start)
