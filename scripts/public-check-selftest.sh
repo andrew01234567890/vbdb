@@ -7,6 +7,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d "$root/.public-check-selftest.XXXXXX")
 broken_index=$(mktemp "$root/.public-check-broken-index.XXXXXX")
 isolated=$(mktemp -d "$root/.public-check-isolated.XXXXXX")
+clean_repo=$(mktemp -d "$root/.public-check-clean.XXXXXX")
 empty_repo=$(mktemp -d "$root/.public-check-empty.XXXXXX")
 history_repo=$(mktemp -d "$root/.public-check-history.XXXXXX")
 staged_repo=$(mktemp -d "$root/.public-check-staged.XXXXXX")
@@ -14,6 +15,7 @@ cleanup() {
 	rm -rf -- "$fixture"
 	rm -f -- "$broken_index"
 	rm -rf -- "$isolated"
+	rm -rf -- "$clean_repo"
 	rm -rf -- "$empty_repo"
 	rm -rf -- "$history_repo"
 	rm -rf -- "$staged_repo"
@@ -27,8 +29,24 @@ trap 'exit 143' TERM
 # credential-looking signature that the publication gate could report.
 marker_prefix='AK'
 marker_suffix='IA0000000000000000'
+token_suffix='abcdefghijklmnopqrstuvwxyz123456'
+ghp_token=$(printf '%s%s%s' 'gh' 'p_' "$token_suffix")
+gho_token=$(printf '%s%s%s' 'gh' 'o_' "$token_suffix")
+ghu_token=$(printf '%s%s%s' 'gh' 'u_' "$token_suffix")
+ghs_token=$(printf '%s%s%s' 'gh' 's_' "$token_suffix")
+ghr_token=$(printf '%s%s%s' 'gh' 'r_' "$token_suffix")
+pgp_header=$(printf '%s%s%s%s' '-----BEGIN ' 'PGP ' 'PRIVATE KEY ' 'BLOCK-----')
+encrypted_header=$(printf '%s%s%s' '-----BEGIN ' 'ENCRYPTED ' 'PRIVATE KEY-----')
 printf '%s%s\n' "$marker_prefix" "$marker_suffix" > "$fixture/fixture.txt"
 printf 'prefix\0%s%s\0suffix\n' "$marker_prefix" "$marker_suffix" > "$fixture/fixture.bin"
+mkdir -p "$fixture/forms"
+printf '%s\n' "$pgp_header" > "$fixture/forms/pgp.txt"
+printf '%s\n' "$encrypted_header" > "$fixture/forms/encrypted.txt"
+printf '%s\n' "$ghp_token" > "$fixture/forms/ghp.txt"
+printf '%s\n' "$gho_token" > "$fixture/forms/gho.txt"
+printf '%s\n' "$ghu_token" > "$fixture/forms/ghu.txt"
+printf '%s\n' "$ghs_token" > "$fixture/forms/ghs.txt"
+printf '%s\n' "$ghr_token" > "$fixture/forms/ghr.txt"
 
 set +e
 output=$("$root/scripts/public-check.sh" 2>&1)
@@ -53,12 +71,29 @@ case "$output" in
 		exit 1
 		;;
 esac
+for form in pgp encrypted ghp gho ghu ghs ghr; do
+	case "$output" in
+		*"forms/$form.txt"*) ;;
+		*)
+			printf 'public-check-selftest: credential form %s was not rejected\n' "$form" >&2
+			exit 1
+			;;
+	esac
+done
 case "$output" in
 	*"$marker_prefix$marker_suffix"*)
 		printf '%s\n' 'public-check-selftest: detector leaked fixture contents' >&2
 		exit 1
 		;;
 esac
+for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
+	case "$output" in
+		*"$secret"*)
+			printf '%s\n' 'public-check-selftest: detector leaked fixture contents' >&2
+			exit 1
+			;;
+	esac
+done
 
 printf '%s\n' 'not-a-git-index' > "$broken_index"
 set +e
@@ -95,6 +130,15 @@ printf '%s\n' 'safe worktree and index' > "$history_repo/history.txt"
 git -C "$history_repo" add history.txt
 git -C "$history_repo" rm -q secrets/old.txt
 git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm clean
+git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit --allow-empty -qm "message-only $gho_token"
+message_commit=$(git -C "$history_repo" rev-parse HEAD)
+base_branch=$(git -C "$history_repo" symbolic-ref --short HEAD)
+git -C "$history_repo" checkout -q -b unpublished-secret
+git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit --allow-empty -qm "branch-only $ghs_token"
+branch_commit=$(git -C "$history_repo" rev-parse HEAD)
+git -C "$history_repo" checkout -q "$base_branch"
+git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid tag -a tag-secret -m "tag-only $ghr_token"
+tag_object=$(git -C "$history_repo" rev-parse 'refs/tags/tag-secret^{tag}')
 set +e
 output=$("$history_repo/scripts/public-check.sh" 2>&1)
 check_status=$?
@@ -111,15 +155,59 @@ case "$output" in
 		;;
 esac
 case "$output" in
+	*"COMMIT:HISTORY:$message_commit"*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: base commit metadata was not scanned' >&2
+		exit 1
+		;;
+esac
+case "$output" in
+	*"COMMIT:HISTORY:$branch_commit"*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: non-HEAD branch commit metadata was not scanned' >&2
+		exit 1
+		;;
+esac
+case "$output" in
+	*"TAG:REF:refs/tags/tag-secret:$tag_object"*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: annotated tag message was not scanned' >&2
+		exit 1
+		;;
+esac
+case "$output" in
 	*'HISTORY:'*'secrets/old.txt'*) ;;
 	*)
 		printf '%s\n' 'public-check-selftest: deleted history private path was not rejected' >&2
 		exit 1
 		;;
 esac
+for secret in "$marker_prefix$marker_suffix" "$gho_token" "$ghs_token" "$ghr_token"; do
+	case "$output" in
+		*"$secret"*)
+			printf '%s\n' 'public-check-selftest: committed fixture contents leaked' >&2
+			exit 1
+			;;
+	esac
+done
+
+mkdir -p "$clean_repo/scripts" "$clean_repo/docs"
+cp "$root/scripts/public-check.sh" "$clean_repo/scripts/public-check.sh"
+printf '%s\n' 'Public contract prose mentions token names and private key examples.' > "$clean_repo/docs/contract.md"
+git -C "$clean_repo" init -q
+git -C "$clean_repo" add scripts/public-check.sh docs/contract.md
+set +e
+output=$("$clean_repo/scripts/public-check.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -ne 0 ]; then
+	printf '%s\n' 'public-check-selftest: ordinary docs or scanner source false-positive' >&2
+	exit 1
+fi
 case "$output" in
-	*"$marker_prefix$marker_suffix"*)
-		printf '%s\n' 'public-check-selftest: committed fixture contents leaked' >&2
+	*passed*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: clean repository did not pass' >&2
 		exit 1
 		;;
 esac

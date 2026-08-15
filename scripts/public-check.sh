@@ -11,19 +11,24 @@ fi
 
 history_manifest=
 tree_manifest=
+refs_manifest=
 index_manifest=
 worktree_manifest=
 content_file=
+object_file=
 failures=0
 source_count=0
 declare -A scanned_blobs=()
+declare -A scanned_objects=()
 
 cleanup() {
 	[ -z "$history_manifest" ] || rm -f -- "$history_manifest"
 	[ -z "$tree_manifest" ] || rm -f -- "$tree_manifest"
+	[ -z "$refs_manifest" ] || rm -f -- "$refs_manifest"
 	[ -z "$index_manifest" ] || rm -f -- "$index_manifest"
 	[ -z "$worktree_manifest" ] || rm -f -- "$worktree_manifest"
 	[ -z "$content_file" ] || rm -f -- "$content_file"
+	[ -z "$object_file" ] || rm -f -- "$object_file"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -42,15 +47,22 @@ make_temp() {
 }
 
 if ! history_manifest=$(make_temp) || ! tree_manifest=$(make_temp) || \
-	! index_manifest=$(make_temp) || ! worktree_manifest=$(make_temp) || \
-	! content_file=$(make_temp); then
+	! refs_manifest=$(make_temp) || ! index_manifest=$(make_temp) || \
+	! worktree_manifest=$(make_temp) || ! content_file=$(make_temp) || \
+	! object_file=$(make_temp); then
 	printf '%s\n' 'public-check: unable to create secure scan files' >&2
 	exit 2
 fi
 
 # Keep this list narrow: ordinary words such as "token" and public header
 # documentation must not be treated as credentials.
-credential_pattern='-----BEGIN (RSA|EC|OPENSSH|DSA|PGP)? ?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}'
+key_begin='-----BEGIN '
+key_end='-----'
+private_word='PRIVATE KEY'
+private_key_pattern="${key_begin}(RSA|EC|OPENSSH|DSA) ${private_word}${key_end}"
+pgp_key_pattern="${key_begin}PGP ${private_word} BLOCK${key_end}"
+encrypted_key_pattern="${key_begin}ENCRYPTED ${private_word}${key_end}"
+credential_pattern="${private_key_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}"
 
 # These are names, not content matches. Examples and source files remain
 # publishable, while common local credential and private-material paths do not.
@@ -97,37 +109,123 @@ scan_blob() {
 	scan_content "$label" "$content_file"
 }
 
-# Every commit reachable from current HEAD is publishable history. An unborn
-# repository has no history; untracked/intended files are still checked below.
-if git -C "$root" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
-	if ! git -C "$root" rev-list --topo-order HEAD >"$history_manifest" 2>/dev/null; then
+scan_tree() {
+	local label=$1 treeish=$2 record meta path object_type object_id
+	if ! git -C "$root" ls-tree -r -z --full-tree "$treeish" >"$tree_manifest" 2>/dev/null; then
+		printf '%s\n' 'public-check: unable to enumerate reachable tree' >&2
+		exit 2
+	fi
+	while IFS= read -r -d '' record; do
+		if [[ "$record" != *$'\t'* ]]; then
+			report "$label" 'malformed Git tree entry'
+			exit 2
+		fi
+		meta=${record%%$'\t'*}
+		path=${record#*$'\t'}
+		read -r _ object_type object_id <<<"$meta"
+		if [ "$object_type" != 'blob' ] || [ -z "$object_id" ]; then
+			continue
+		fi
+		if is_high_risk_name "$path"; then
+			report "$label:$path" 'high-risk private artifact filename'
+			continue
+		fi
+		scan_blob "$label:$path" "$object_id"
+	done <"$tree_manifest"
+}
+
+scan_object() {
+	local label=$1 object_id=$2 object_type line candidate target=
+	if [[ ${scanned_objects[$object_id]+seen} ]]; then
+		return
+	fi
+	scanned_objects[$object_id]=seen
+	if ! object_type=$(git -C "$root" cat-file -t "$object_id" 2>/dev/null); then
+		report "$label:$object_id" 'unable to read reachable Git object'
+		exit 2
+	fi
+	case "$object_type" in
+		commit)
+			if ! git -C "$root" cat-file commit "$object_id" >"$object_file" 2>/dev/null; then
+				report "COMMIT:$object_id" 'unable to read reachable commit object'
+				exit 2
+			fi
+			scan_content "COMMIT:$label:$object_id" "$object_file"
+			scan_tree "$label:$object_id" "$object_id"
+			;;
+		tag)
+			if ! git -C "$root" cat-file tag "$object_id" >"$object_file" 2>/dev/null; then
+				report "TAG:$object_id" 'unable to read reachable tag object'
+				exit 2
+			fi
+			scan_content "TAG:$label:$object_id" "$object_file"
+			while IFS= read -r line; do
+				case "$line" in
+					object\ *)
+						candidate=${line#object }
+						if [[ "$candidate" =~ ^[0-9a-f]{40}$ || "$candidate" =~ ^[0-9a-f]{64}$ ]]; then
+							target=$candidate
+							break
+						fi
+						;;
+				esac
+			done <"$object_file"
+			if [ -z "$target" ]; then
+				report "TAG:$label:$object_id" 'malformed reachable tag object'
+				exit 2
+			fi
+			scan_object "$label" "$target"
+			;;
+		tree)
+			scan_tree "TREE:$label:$object_id" "$object_id"
+			;;
+		blob)
+			scan_blob "BLOB:$label:$object_id" "$object_id"
+			;;
+		*)
+			report "$label:$object_id" 'unsupported reachable Git object type'
+			exit 2
+			;;
+	esac
+}
+
+# Every commit reachable from any local ref, plus a detached HEAD, is
+# publishable history. An unborn repository has no history; untracked files
+# are still checked below. The raw commit payload is scanned for metadata and
+# message content in addition to each commit tree.
+if head_oid=$(git -C "$root" rev-parse --verify --quiet HEAD 2>/dev/null); then
+	if ! git -C "$root" rev-list --topo-order --all "$head_oid" >"$history_manifest" 2>/dev/null; then
 		printf '%s\n' 'public-check: unable to enumerate reachable history' >&2
 		exit 2
 	fi
-	while IFS= read -r commit; do
-		if ! git -C "$root" ls-tree -r -z --full-tree "$commit" >"$tree_manifest" 2>/dev/null; then
-			printf '%s\n' 'public-check: unable to enumerate reachable tree' >&2
-			exit 2
-		fi
-		while IFS= read -r -d '' record; do
-			if [[ "$record" != *$'\t'* ]]; then
-				report "HISTORY:$commit" 'malformed Git tree entry'
-				exit 2
-			fi
-			meta=${record%%$'\t'*}
-			path=${record#*$'\t'}
-			read -r _ object_type object_id <<<"$meta"
-			if [ "$object_type" != 'blob' ] || [ -z "$object_id" ]; then
-				continue
-			fi
-			if is_high_risk_name "$path"; then
-				report "HISTORY:$commit:$path" 'high-risk private artifact filename'
-				continue
-			fi
-			scan_blob "HISTORY:$commit:$path" "$object_id"
-		done <"$tree_manifest"
-	done <"$history_manifest"
+else
+	if ! git -C "$root" rev-list --topo-order --all >"$history_manifest" 2>/dev/null; then
+		printf '%s\n' 'public-check: unable to enumerate reachable history' >&2
+		exit 2
+	fi
 fi
+while IFS= read -r commit; do
+	scan_object 'HISTORY' "$commit"
+done <"$history_manifest"
+
+# Scan ref objects themselves so annotated tag messages and nested tag targets
+# cannot bypass the commit/tree walk. for-each-ref emits a NUL after each ref
+# name and a newline after its object ID.
+if ! git -C "$root" for-each-ref --format='%(refname)%00%(objectname)' >"$refs_manifest" 2>/dev/null; then
+	printf '%s\n' 'public-check: unable to enumerate refs' >&2
+	exit 2
+fi
+while IFS= read -r -d '' ref; do
+	if ! IFS= read -r object_id; then
+		printf '%s\n' 'public-check: malformed refs enumeration' >&2
+		exit 2
+	fi
+	if [[ ! "$object_id" =~ ^[0-9a-f]{40}$ && ! "$object_id" =~ ^[0-9a-f]{64}$ ]]; then
+		printf '%s\n' 'public-check: malformed refs enumeration' >&2
+		exit 2
+	fi
+	scan_object "REF:$ref" "$object_id"
+done <"$refs_manifest"
 
 # Stage-zero index bytes are publishable. Any unresolved stage is rejected
 # instead of allowing an ambiguous index to pass the safety gate.

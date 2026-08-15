@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +122,58 @@ func TestCanonicalBytesAreIndependentCopies(t *testing.T) {
 	}
 	if !bytes.Equal(document.Bytes(), []byte(`{"a":1}`)) {
 		t.Fatalf("document bytes changed through returned slice: %s", document.Bytes())
+	}
+}
+
+func TestRejectsNestingBeyondMaximum(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		open  string
+		close string
+	}{
+		{name: "arrays", open: "[", close: "]"},
+		{name: "objects", open: `{"a":`, close: "}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			boundary := strings.Repeat(test.open, MaxDepth) + "null" + strings.Repeat(test.close, MaxDepth)
+			if err := Validate([]byte(boundary)); err != nil {
+				t.Fatalf("boundary depth rejected: %v", err)
+			}
+			tooDeep := strings.Repeat(test.open, MaxDepth+1) + "null" + strings.Repeat(test.close, MaxDepth+1)
+			if err := Validate([]byte(tooDeep)); err == nil {
+				t.Fatal("depth above maximum was accepted")
+			}
+			malformed := strings.Repeat(test.open, MaxDepth+1)
+			if err := Validate([]byte(malformed)); err == nil {
+				t.Fatal("malformed over-depth input was accepted")
+			}
+		})
+	}
+}
+
+func TestValueReturnsDeepCopy(t *testing.T) {
+	document, err := Parse([]byte(`{"nested":{"items":[{"value":1}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := document.Value().(map[string]any)
+	nested := value["nested"].(map[string]any)
+	items := nested["items"].([]any)
+	items[0].(map[string]any)["value"] = json.Number("99")
+	items = append(items, json.Number("2"))
+	nested["items"] = items
+	nested["new"] = true
+	value["nested"] = nested
+	value["other"] = "changed"
+
+	if got, want := string(document.Bytes()), `{"nested":{"items":[{"value":1}]}}`; got != want {
+		t.Fatalf("mutating Value changed canonical bytes: got %s, want %s", got, want)
+	}
+	second := document.Value().(map[string]any)
+	if _, ok := second["other"]; ok {
+		t.Fatal("mutating Value changed the stored value")
+	}
+	if got := second["nested"].(map[string]any)["items"].([]any); len(got) != 1 {
+		t.Fatalf("mutating Value changed stored nested slice: %#v", got)
 	}
 }

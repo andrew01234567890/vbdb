@@ -50,11 +50,12 @@ The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
 milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.md).
 
-`make public-check` scans every commit reachable from the current `HEAD`,
-stage-zero index blobs, and current tracked/non-ignored intended files for
-high-risk artifact names and credential/private-key signatures. It reports
-filenames and categories only, never matching contents. `make
-public-check-selftest` exercises binary data, reachable-history/index coverage,
-path rules, and fail-closed enumeration. Local environment files, keys,
+`make public-check` scans commits and trees reachable from all local refs (plus
+a detached `HEAD`), raw commit and annotated-tag objects, stage-zero index
+blobs, and current tracked/non-ignored intended files for high-risk artifact
+names and credential/private-key signatures. It reports filenames and
+categories only, never matching contents. `make public-check-selftest`
+exercises binary data, ref/history/index coverage, commit/tag metadata, path
+rules, and fail-closed enumeration. Local environment files, keys,
 credentials, and secret/private directories are ignored by default; committed
 configuration must use a safe example file instead.

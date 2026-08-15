@@ -87,11 +87,11 @@ func (r *Registry) Hit(name string) bool {
 	return true
 }
 
-func (r *Registry) Hits(name string) uint64 {
+func (r *Registry) Hits(name string) (uint64, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if point, ok := r.points[name]; ok {
-		return point.hits
+		return point.hits, nil
 	}
-	return 0
+	return 0, fmt.Errorf("%w %q", ErrUnknown, name)
 }

@@ -1,6 +1,7 @@
 package failpoint
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -20,7 +21,11 @@ func TestRegistryDisabledByDefaultAndExplicitlyInjectable(t *testing.T) {
 	if err := first.Enable("before-commit"); err != nil {
 		t.Fatal(err)
 	}
-	if !first.Hit("before-commit") || first.Hits("before-commit") != 1 {
+	if !first.Hit("before-commit") {
+		t.Fatal("enabled failpoint did not report a hit")
+	}
+	hits, err := first.Hits("before-commit")
+	if err != nil || hits != 1 {
 		t.Fatal("enabled failpoint did not report and count a hit")
 	}
 	if second.Enabled("before-commit") {
@@ -44,6 +49,15 @@ func TestRegistryRejectsUnknownAndEmptyNames(t *testing.T) {
 	}
 	if err := r.Disable("missing"); err == nil {
 		t.Fatal("unknown name accepted")
+	}
+	if hits, err := r.Hits("missing"); !errors.Is(err, ErrUnknown) || hits != 0 {
+		t.Fatalf("unknown Hits() = %d, %v; want zero and ErrUnknown", hits, err)
+	}
+	if err := r.Register("zero"); err != nil {
+		t.Fatal(err)
+	}
+	if hits, err := r.Hits("zero"); err != nil || hits != 0 {
+		t.Fatalf("registered zero-hit = %d, %v; want zero and nil", hits, err)
 	}
 }
 
@@ -69,7 +83,11 @@ func TestRegistryRaceSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got, want := r.Hits("io"), uint64(workers*hitsPerWorker); got != want {
+	got, err := r.Hits("io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(workers * hitsPerWorker); got != want {
 		t.Fatalf("hit count = %d, want %d", got, want)
 	}
 }

@@ -16,6 +16,11 @@ import (
 
 var numberPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
 
+// MaxDepth is the greatest number of nested JSON arrays or objects accepted
+// by Parse. Bounding nesting keeps validation and canonicalization recursion
+// finite before encoding/json is asked to marshal the decoded value.
+const MaxDepth = 128
+
 // Document is a validated JSON document and its deterministic representation.
 // The decoded value retains every number as json.Number, never float64.
 type Document struct {
@@ -34,7 +39,7 @@ func Parse(input []byte) (Document, error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.UseNumber()
-	value, err := parseValue(decoder)
+	value, err := parseValue(decoder, 0)
 	if err != nil {
 		return Document{}, fmt.Errorf("jsondoc: %w", err)
 	}
@@ -69,23 +74,26 @@ func Validate(input []byte) error {
 // Bytes returns a copy of the canonical representation.
 func (d Document) Bytes() []byte { return append([]byte(nil), d.canonical...) }
 
-// Value returns the validated decoded value. Numbers are json.Number values.
-// Callers that retain or mutate the result should first copy it; the
-// canonical representation returned by Bytes remains unchanged.
-func (d Document) Value() any { return d.value }
+// Value returns a deep copy of the validated decoded value. Numbers are
+// json.Number values. Mutating the result cannot change the document or its
+// canonical representation.
+func (d Document) Value() any { return cloneValue(d.value) }
 
-func parseValue(decoder *json.Decoder) (any, error) {
+func parseValue(decoder *json.Decoder, depth int) (any, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return nil, err
 	}
 	switch token := token.(type) {
 	case json.Delim:
+		if depth >= MaxDepth {
+			return nil, fmt.Errorf("maximum nesting depth %d exceeded", MaxDepth)
+		}
 		switch token {
 		case '{':
-			return parseObject(decoder)
+			return parseObject(decoder, depth+1)
 		case '[':
-			return parseArray(decoder)
+			return parseArray(decoder, depth+1)
 		default:
 			return nil, fmt.Errorf("unexpected delimiter %q", token)
 		}
@@ -101,7 +109,7 @@ func parseValue(decoder *json.Decoder) (any, error) {
 	}
 }
 
-func parseObject(decoder *json.Decoder) (map[string]any, error) {
+func parseObject(decoder *json.Decoder, depth int) (map[string]any, error) {
 	object := make(map[string]any)
 	for decoder.More() {
 		token, err := decoder.Token()
@@ -115,7 +123,7 @@ func parseObject(decoder *json.Decoder) (map[string]any, error) {
 		if _, exists := object[key]; exists {
 			return nil, fmt.Errorf("duplicate object key %q", key)
 		}
-		value, err := parseValue(decoder)
+		value, err := parseValue(decoder, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -131,10 +139,10 @@ func parseObject(decoder *json.Decoder) (map[string]any, error) {
 	return object, nil
 }
 
-func parseArray(decoder *json.Decoder) ([]any, error) {
+func parseArray(decoder *json.Decoder, depth int) ([]any, error) {
 	array := make([]any, 0)
 	for decoder.More() {
-		value, err := parseValue(decoder)
+		value, err := parseValue(decoder, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -148,6 +156,25 @@ func parseArray(decoder *json.Decoder) ([]any, error) {
 		return nil, fmt.Errorf("array ended with %v", end)
 	}
 	return array, nil
+}
+
+func cloneValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		clone := make(map[string]any, len(value))
+		for key, nested := range value {
+			clone[key] = cloneValue(nested)
+		}
+		return clone
+	case []any:
+		clone := make([]any, len(value))
+		for i, nested := range value {
+			clone[i] = cloneValue(nested)
+		}
+		return clone
+	default:
+		return value
+	}
 }
 
 func validateSurrogateEscapes(input []byte) error {

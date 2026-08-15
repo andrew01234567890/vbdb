@@ -19,11 +19,13 @@ const int64SignMask uint64 = 1 << 63
 type Kind byte
 
 const (
-	BytesKind Kind = iota + 1
-	StringKind
-	Int64Kind
-	Uint64Kind
-	BoolKind
+	// These numeric assignments are persistent format-v1 tags. Do not use
+	// iota here: adding or reordering a kind must never rewrite old keys.
+	BytesKind  Kind = 0x01
+	StringKind Kind = 0x02
+	Int64Kind  Kind = 0x03
+	Uint64Kind Kind = 0x04
+	BoolKind   Kind = 0x05
 )
 
 // Component is one typed value in a tuple. Construct components with the
@@ -72,7 +74,8 @@ func (c Component) Bytes() ([]byte, error) {
 	return append([]byte(nil), c.data...), nil
 }
 
-func (c Component) String() (string, error) {
+// Text returns the string value of a StringKind component.
+func (c Component) Text() (string, error) {
 	if c.kind != StringKind {
 		return "", fmt.Errorf("codec: component is %s, not string", c.kind)
 	}

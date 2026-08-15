@@ -161,3 +161,13 @@ func TestConstructorsCopyByteSlices(t *testing.T) {
 		t.Fatalf("constructor retained mutable input: %v", got)
 	}
 }
+
+func TestTextAccessorIsExplicit(t *testing.T) {
+	component, err := String("hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := component.Text(); err != nil || got != "hello" {
+		t.Fatalf("Text() = %q, %v", got, err)
+	}
+}
