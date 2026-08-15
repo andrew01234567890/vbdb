@@ -1,0 +1,225 @@
+// Package jsondoc validates and canonicalizes VBDB JSON documents without
+// converting numbers through float64. Canonical output is compact JSON with
+// object keys in encoding/json's deterministic lexical order and number
+// tokens emitted losslessly.
+package jsondoc
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"unicode/utf8"
+)
+
+var numberPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+
+// Document is a validated JSON document and its deterministic representation.
+// The decoded value retains every number as json.Number, never float64.
+type Document struct {
+	value     any
+	canonical []byte
+}
+
+// Parse validates input, rejects duplicate object keys and trailing data, and
+// returns a lossless canonical document.
+func Parse(input []byte) (Document, error) {
+	if !utf8.Valid(input) {
+		return Document{}, errors.New("jsondoc: input is not valid UTF-8")
+	}
+	if err := validateSurrogateEscapes(input); err != nil {
+		return Document{}, fmt.Errorf("jsondoc: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.UseNumber()
+	value, err := parseValue(decoder)
+	if err != nil {
+		return Document{}, fmt.Errorf("jsondoc: %w", err)
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return Document{}, fmt.Errorf("jsondoc: trailing JSON value %v", token)
+		}
+		return Document{}, fmt.Errorf("jsondoc: trailing data: %w", err)
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return Document{}, fmt.Errorf("jsondoc: canonical encoding: %w", err)
+	}
+	return Document{value: value, canonical: canonical}, nil
+}
+
+// Canonicalize validates input and returns its canonical JSON bytes.
+func Canonicalize(input []byte) ([]byte, error) {
+	document, err := Parse(input)
+	if err != nil {
+		return nil, err
+	}
+	return document.Bytes(), nil
+}
+
+// Validate reports whether input is a supported JSON document.
+func Validate(input []byte) error {
+	_, err := Parse(input)
+	return err
+}
+
+// Bytes returns a copy of the canonical representation.
+func (d Document) Bytes() []byte { return append([]byte(nil), d.canonical...) }
+
+// Value returns the validated decoded value. Numbers are json.Number values.
+// Callers that retain or mutate the result should first copy it; the
+// canonical representation returned by Bytes remains unchanged.
+func (d Document) Value() any { return d.value }
+
+func parseValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	switch token := token.(type) {
+	case json.Delim:
+		switch token {
+		case '{':
+			return parseObject(decoder)
+		case '[':
+			return parseArray(decoder)
+		default:
+			return nil, fmt.Errorf("unexpected delimiter %q", token)
+		}
+	case json.Number:
+		if !numberPattern.MatchString(token.String()) {
+			return nil, fmt.Errorf("unsupported number form %q", token.String())
+		}
+		return token, nil
+	case string, bool, nil:
+		return token, nil
+	default:
+		return nil, fmt.Errorf("unsupported token type %T", token)
+	}
+}
+
+func parseObject(decoder *json.Decoder) (map[string]any, error) {
+	object := make(map[string]any)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("object key is %T, not string", token)
+		}
+		if _, exists := object[key]; exists {
+			return nil, fmt.Errorf("duplicate object key %q", key)
+		}
+		value, err := parseValue(decoder)
+		if err != nil {
+			return nil, err
+		}
+		object[key] = value
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if end != json.Delim('}') {
+		return nil, fmt.Errorf("object ended with %v", end)
+	}
+	return object, nil
+}
+
+func parseArray(decoder *json.Decoder) ([]any, error) {
+	array := make([]any, 0)
+	for decoder.More() {
+		value, err := parseValue(decoder)
+		if err != nil {
+			return nil, err
+		}
+		array = append(array, value)
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if end != json.Delim(']') {
+		return nil, fmt.Errorf("array ended with %v", end)
+	}
+	return array, nil
+}
+
+func validateSurrogateEscapes(input []byte) error {
+	for offset := 0; offset < len(input); offset++ {
+		if input[offset] != '"' {
+			continue
+		}
+		for offset++; offset < len(input); offset++ {
+			switch input[offset] {
+			case '"':
+				goto nextString
+			case '\\':
+				offset++
+				if offset >= len(input) {
+					return errors.New("unterminated JSON string escape")
+				}
+				if input[offset] != 'u' {
+					continue
+				}
+				if offset+4 >= len(input) {
+					return errors.New("truncated Unicode escape")
+				}
+				code, ok := parseHexQuad(input[offset+1 : offset+5])
+				if !ok {
+					return errors.New("invalid Unicode escape")
+				}
+				if isLowSurrogate(code) {
+					return errors.New("unpaired low-surrogate escape")
+				}
+				if !isHighSurrogate(code) {
+					offset += 4
+					continue
+				}
+				// A high surrogate must be immediately followed by a low
+				// surrogate escape. encoding/json otherwise replaces it with
+				// U+FFFD, which would silently change persisted data.
+				if offset+10 >= len(input) || input[offset+5] != '\\' || input[offset+6] != 'u' {
+					return errors.New("unpaired high-surrogate escape")
+				}
+				low, ok := parseHexQuad(input[offset+7 : offset+11])
+				if !ok || !isLowSurrogate(low) {
+					return errors.New("high-surrogate escape is not followed by a low surrogate")
+				}
+				offset += 10
+			}
+		}
+		return errors.New("unterminated JSON string")
+	nextString:
+	}
+	return nil
+}
+
+func parseHexQuad(input []byte) (uint16, bool) {
+	if len(input) != 4 {
+		return 0, false
+	}
+	var value uint16
+	for _, digit := range input {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value += uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value += uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value += uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
+}
+
+func isHighSurrogate(value uint16) bool { return value >= 0xd800 && value <= 0xdbff }
+func isLowSurrogate(value uint16) bool  { return value >= 0xdc00 && value <= 0xdfff }

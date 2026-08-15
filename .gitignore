@@ -1,0 +1,35 @@
+# Go build and test output
+/bin/
+*.test
+*.out
+coverage.out
+
+# Local tooling and editor state
+.idea/
+.vscode/
+*.swp
+
+# Local databases, logs, and generated manifests
+/.vbdb/
+*.log
+*.tmp
+
+# Local credentials and private material (never publish these)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+credentials/
+secrets/
+private/
+.codex/
+.claude/
+.aws/
+.ssh/
+.kube/config
