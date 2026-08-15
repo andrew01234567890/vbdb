@@ -16,7 +16,9 @@ truncation, and trailing bytes.
 any depth, invalid UTF-8, trailing values, and invalid/non-finite number forms.
 Canonical output is compact JSON with deterministic object-key ordering and
 number tokens emitted without a float64 conversion, preserving arbitrarily
-large integer precision.
+large integer precision. Exact numeric token spellings are preserved in the
+canonical bytes; those bytes are not a semantic numeric-equality oracle. For
+example, `1`, `1.0`, and `1e0` remain distinct canonical spellings.
 
 ## Consequences
 

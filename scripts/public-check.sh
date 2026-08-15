@@ -10,7 +10,17 @@ if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 status=0
-own_script='scripts/public-check.sh'
+enum_file=$(mktemp "${TMPDIR:-/tmp}/vbdb-public-check.XXXXXX") || {
+	printf '%s\n' 'public-check: unable to create secure enumeration file' >&2
+	exit 2
+}
+cleanup() {
+	rm -f -- "$enum_file"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 report() {
 	printf 'public-check: %s: %s\n' "$1" "$2"
@@ -39,9 +49,13 @@ is_high_risk_name() {
 # documentation must not be treated as credentials.
 credential_pattern='-----BEGIN (RSA|EC|OPENSSH|DSA|PGP)? ?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}'
 
+if ! git -C "$root" ls-files --cached --others --exclude-standard -z >"$enum_file"; then
+	printf '%s\n' 'public-check: unable to enumerate Git files' >&2
+	exit 2
+fi
+
 while IFS= read -r -d '' path; do
 	rel=$path
-	[ "$rel" = "$own_script" ] && continue
 	if is_high_risk_name "$rel"; then
 		report "$rel" 'high-risk private artifact filename'
 		continue
@@ -58,7 +72,7 @@ while IFS= read -r -d '' path; do
 		1) ;;
 		*) report "$rel" 'unable to scan file' ;;
 	esac
-done < <(git -C "$root" ls-files --cached --others --exclude-standard -z)
+done <"$enum_file"
 
 if [ "$status" -eq 0 ]; then
 	printf '%s\n' 'public-check: passed'

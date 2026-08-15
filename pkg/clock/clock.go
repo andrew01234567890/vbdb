@@ -65,17 +65,15 @@ func (c *Manual) Advance(duration time.Duration) {
 		panic("clock: cannot move manual clock backwards")
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.now = c.now.Add(duration)
 	for timer := range c.timers {
 		if timer.active && !timer.deadline.After(c.now) {
 			timer.active = false
 			delete(c.timers, timer)
-			// The channel has capacity one and this send is performed while
-			// holding c.mu, so a concurrent Reset cannot race the delivery.
-			timer.ch <- c.now
+			timer.deliverLocked(c.now)
 		}
 	}
-	c.mu.Unlock()
 }
 
 func (c *Manual) NewTimer(duration time.Duration) Timer {
@@ -90,7 +88,7 @@ func (c *Manual) NewTimer(duration time.Duration) Timer {
 		// A zero or negative standard-library timer is ready immediately.
 		// The buffered channel makes this delivery nonblocking and avoids a
 		// goroutine in deterministic tests.
-		timer.ch <- c.now
+		timer.deliverLocked(c.now)
 		return timer
 	}
 	timer.active = true
@@ -107,12 +105,30 @@ type manualTimer struct {
 
 func (t *manualTimer) C() <-chan time.Time { return t.ch }
 
+// deliverLocked enforces the invariant that an active timer's one-slot
+// channel is empty before delivery. A full channel means a timer tick would be
+// silently dropped, so fail loudly while the owning clock lock is held.
+func (t *manualTimer) deliverLocked(now time.Time) {
+	select {
+	case t.ch <- now:
+	default:
+		panic("clock: timer channel invariant violated")
+	}
+}
+
+func (t *manualTimer) requireEmptyLocked() {
+	if len(t.ch) != 0 {
+		panic("clock: active timer channel invariant violated")
+	}
+}
+
 func (t *manualTimer) Stop() bool {
 	t.clock.mu.Lock()
 	defer t.clock.mu.Unlock()
 	if !t.active {
 		return false
 	}
+	t.requireEmptyLocked()
 	t.active = false
 	delete(t.clock.timers, t)
 	return true
@@ -122,7 +138,9 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 	t.clock.mu.Lock()
 	defer t.clock.mu.Unlock()
 	wasActive := t.active
-	if !wasActive {
+	if wasActive {
+		t.requireEmptyLocked()
+	} else {
 		// Match the useful part of time.Timer's reset contract for this
 		// deterministic implementation: discard an already queued event.
 		select {
@@ -134,7 +152,7 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 	t.deadline = t.clock.now.Add(duration)
 	if duration <= 0 {
 		t.active = false
-		t.ch <- t.clock.now
+		t.deliverLocked(t.clock.now)
 		return wasActive
 	}
 	t.active = true

@@ -89,6 +89,18 @@ func TestManualResetAfterStopIsImmediatelyReady(t *testing.T) {
 	}
 }
 
+func TestManualTimerDeliveryPanicsIfChannelIsNotEmpty(t *testing.T) {
+	c := NewManual(time.Unix(0, 0))
+	timer := c.NewTimer(time.Second).(*manualTimer)
+	timer.ch <- c.Now()
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("timer delivery silently accepted a full channel")
+		}
+	}()
+	c.Advance(time.Second)
+}
+
 func TestManualConcurrentAccess(t *testing.T) {
 	c := NewManual(time.Unix(0, 0))
 	const workers = 16

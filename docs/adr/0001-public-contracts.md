@@ -27,12 +27,16 @@ aborts the transaction. An open transaction holds no locks. The configurable
 deadline defaults to 30 seconds and is capped at five minutes; it is fixed in
 the replicated transaction record and cannot be extended by a heartbeat.
 When it expires, the transaction automatically rolls back to `EXPIRED`.
-Commit or rollback after expiry returns 410. A durable `COMMITTED` decision
-wins only when recorded before the deadline, even if its HTTP response arrives
-later; otherwise expiry wins. Creation returns 201, a committed or rolled-back
-operation is 200, and an unknown transaction is 404. Repeating the same
-terminal operation is idempotent; a conflicting terminal operation returns
-409 and leaves the recorded terminal state unchanged.
+The replicated recorded state is authoritative: 410 is returned only when that
+state is `EXPIRED`. A durable `COMMITTED` or `ROLLED_BACK` state recorded before
+the deadline wins over a later wall-clock expiry; retrying the same terminal
+operation then returns 200. A durable `COMMITTED` decision can win only when
+recorded before the deadline; otherwise the replicated expiry state wins.
+Creation returns 201, a committed or rolled-back operation is 200, and an
+unknown transaction is 404. Repeating the same terminal operation is
+idempotent; a conflicting terminal operation returns 409 and leaves the
+recorded terminal state unchanged. `GET /transactions/{id}` always reports the
+recorded state, including `EXPIRED`.
 
 CDC uses `GET /_cdc` or `GET /_cdc/{table}` with `Accept: text/event-stream`.
 The stream returns 200 and events are committed logical transactions, globally

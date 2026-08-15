@@ -10,11 +10,17 @@ Production code is native Go. Pebble is the local durable storage engine and
 voting replicas across three failure zones. Writes require a persisted quorum;
 VBDB fails closed after quorum loss and never auto-promotes a minority.
 
-Follower reads remain strong. A leader publishes a closed timestamp; a
-follower can answer only after applying the requested range generation through
-that timestamp. Otherwise the gateway routes to the leader. Additional
-non-voting read replicas may offload reads and background work but never count
-toward durability.
+Default GET and QUERY reads remain strong when offloaded. After request
+invocation, the gateway obtains a shard-leader `ReadIndex` (or an equivalent
+valid leader-lease freshness fence) for every participating range. The fence
+binds the range generation and a required applied index. A follower or
+non-voting read replica may perform the data read only after matching the range
+generation and applying through that index. If the leader fence is unavailable,
+the gateway fails closed or reroutes to the leader; it does not silently serve
+an older result. Closed timestamps are reserved for an explicitly stale/as-of
+read mode and are not the freshness proof for default strong GET/QUERY reads.
+Additional non-voting read replicas may offload reads and background work but
+never count toward durability.
 
 Primary keys map to stable 128-bit hash tokens. Every range descriptor carries
 an ID, logical bounds, a monotonically increasing generation, placements, and
