@@ -198,15 +198,23 @@ set -e
 	exit 1
 }
 
-git -C "$merge_repo" checkout -q -b left-middle "$merge_initial"
+# A blank added as the final changed line of a mid-file hunk is legal when the
+# following unchanged context line remains. The checker must not confuse it
+# with a blank at EOF (covered by the preceding case).
+git -C "$merge_repo" checkout -q -b middle-base "$merge_initial"
 mkdir -p "$merge_repo/nested"
-printf '%s\n' left > "$merge_repo/nested/middle-only.txt"
+printf '%s\n%s\n' base tail > "$merge_repo/nested/middle-only.txt"
+git -C "$merge_repo" add nested/middle-only.txt
+git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm middle-base
+middle_base=$(git -C "$merge_repo" rev-parse HEAD)
+git -C "$merge_repo" checkout -q -b left-middle "$middle_base"
+printf '%s\n%s\n' left tail > "$merge_repo/nested/middle-only.txt"
 git -C "$merge_repo" add nested/middle-only.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm left-middle
 merge_left_middle=$(git -C "$merge_repo" rev-parse HEAD)
-git -C "$merge_repo" checkout -q -b right-middle "$merge_initial"
+git -C "$merge_repo" checkout -q -b right-middle "$middle_base"
 mkdir -p "$merge_repo/nested"
-printf '%s\n' right > "$merge_repo/nested/middle-only.txt"
+printf '%s\n%s\n' other tail > "$merge_repo/nested/middle-only.txt"
 git -C "$merge_repo" add nested/middle-only.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm right-middle
 git -C "$merge_repo" checkout -q left-middle
@@ -218,7 +226,7 @@ set -e
 	printf '%s\n' 'diff-check-selftest: expected middle-only merge conflict was absent' >&2
 	exit 1
 }
-printf '%s\n\n%s\n' first second > "$merge_repo/nested/middle-only.txt"
+printf '%s\n\n%s\n' first tail > "$merge_repo/nested/middle-only.txt"
 git -C "$merge_repo" add nested/middle-only.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm 'merge middle blank'
 merge_middle_head=$(git -C "$merge_repo" rev-parse HEAD)

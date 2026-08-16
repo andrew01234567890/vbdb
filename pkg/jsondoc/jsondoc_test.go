@@ -44,6 +44,21 @@ func TestRejectsDuplicateKeysAtEveryDepth(t *testing.T) {
 	}
 }
 
+func TestDuplicateKeyErrorIsStableAndRedacted(t *testing.T) {
+	key := strings.Repeat("untrusted-key-", 1<<14)
+	input := []byte(`{"` + key + `":1,"` + key + `":2}`)
+	err := Validate(input)
+	if err == nil {
+		t.Fatal("accepted duplicate large key")
+	}
+	if got, want := err.Error(), "jsondoc: duplicate object key"; got != want {
+		t.Fatalf("duplicate-key error = %q, want %q", got, want)
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Fatal("duplicate-key error echoed the untrusted key")
+	}
+}
+
 func TestRejectsInvalidUTF8TrailingAndUnsupportedNumbers(t *testing.T) {
 	cases := [][]byte{
 		[]byte(`{"a":1} {"b":2}`),
@@ -56,6 +71,25 @@ func TestRejectsInvalidUTF8TrailingAndUnsupportedNumbers(t *testing.T) {
 		if err := Validate(input); err == nil {
 			t.Errorf("accepted invalid JSON %x", input)
 		}
+	}
+}
+
+func TestDocumentSizeBoundaryAndRedactedInvalidNumber(t *testing.T) {
+	boundary := append(bytes.Repeat([]byte{' '}, MaxDocumentBytes-len("null")), []byte("null")...)
+	if _, err := Parse(boundary); err != nil {
+		t.Fatalf("accepted document-size boundary: %v", err)
+	}
+	tooLarge := append(boundary, ' ')
+	if _, err := Parse(tooLarge); err == nil {
+		t.Fatal("accepted document above MaxDocumentBytes")
+	}
+	invalidNumber := "0" + strings.Repeat("0", 100000)
+	_, err := Parse([]byte(invalidNumber))
+	if err == nil {
+		t.Fatal("accepted invalid number form")
+	}
+	if strings.Contains(err.Error(), invalidNumber) {
+		t.Fatal("invalid-number error echoed the untrusted number")
 	}
 }
 

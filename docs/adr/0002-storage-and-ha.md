@@ -10,6 +10,14 @@ Production code is native Go. Pebble is the local durable storage engine and
 voting replicas across three failure zones. Writes require a persisted quorum;
 VBDB fails closed after quorum loss and never auto-promotes a minority.
 
+The future storage-record contract is checksummed records with recovery
+validation before serving. A failed or lying sync, ENOSPC, or other durability
+uncertainty is fail-stop: the node must not acknowledge or serve data whose
+durability is unproven, and recovery must validate record checksums and
+boundaries before reopening service. This is a design requirement only; no
+storage engine, checksum format, or fault-handling path is implemented in
+Milestone 1.
+
 The clock contract is explicit: `Clock.Now` readings used for elapsed-time
 logic are monotonic within a process, while persisted HLC/deadline values are
 explicit wall/HLC scalars with Go's process-local monotonic component stripped
@@ -17,7 +25,10 @@ before serialization. Equality and ordering of persisted values use their
 encoded scalar fields, never hidden Go monotonic metadata. Manual clocks obey
 the same nondecreasing/equality contract deterministically; Real clocks retain
 the platform wall-clock failure behavior and require the replicated time
-authority for deadline decisions.
+authority for deadline decisions. The Go module pins synchronous timer-channel
+semantics with `godebug asynctimerchan=0`, so Real/manual timer parity is the
+default contract; an operator who overrides `GODEBUG` accepts the standard
+library's alternate timer behavior and any resulting parity difference.
 
 Default GET reads are linearizable when offloaded. After request invocation,
 the gateway obtains a shard-leader `ReadIndex` (or an equivalent valid
@@ -49,6 +60,13 @@ and Pebble block caches. Every strong cache hit carries a matching range
 generation plus applied-index or HLC freshness fence; CDC invalidation is only
 an optimization and never the correctness proof. Transaction-private staged
 data never enters a shared cache tier. QUERY responses remain `no-store`.
+
+CDC closed frontiers are durable replicated state, not process-local counters.
+A restart or leader change must recover the last durably validated per-range
+frontier before serving it, and an unresolved prepare/commit position keeps the
+frontier below that position until its decision and participant fragments are
+durably resolved. This prevents a late event at or below an advertised frontier
+from appearing after recovery.
 
 Global secondary indexes are independently sharded, replicated ranges and
 synchronous participants in row writes/2PC. Every write validates and reserves
@@ -99,13 +117,16 @@ cluster time under the declared maximum skew bound. `COMMITTED` may be chosen
 only when `latest < deadline`; `EXPIRED` may be chosen only when
 `earliest >= deadline`. If the interval straddles the deadline, or the bound
 is unavailable during a clock jump, leadership change, or failover, the state
-remains `OPEN` and the request returns retryable 503 until the authority
-recovers. The chosen interval evidence, deadline comparison, and terminal state
-are one consensus transition, retained for recovery and history checking; no
-replica uses local apply-time wall clock. A client `ROLLED_BACK` decision also
-requires `latest < deadline`; `earliest >= deadline` chooses `EXPIRED`, while a
-straddling or unavailable interval leaves `OPEN` with retryable 503. These
-mechanisms are later milestones and are not implemented here.
+remains in its current non-terminal `OPEN` or `PREPARING` state and the request
+returns retryable 503 until the authority recovers. In particular, uncertainty
+never moves `PREPARING` back to `OPEN`. The chosen interval evidence, deadline
+comparison, and terminal state are one consensus transition, retained for
+recovery and history checking; no replica uses local apply-time wall clock. A
+client `ROLLED_BACK` decision also requires `latest < deadline`;
+`earliest >= deadline` chooses `EXPIRED`, while a straddling or unavailable
+interval leaves the current non-terminal `OPEN` or `PREPARING` state with
+retryable 503. These mechanisms are later milestones and are not implemented
+here.
 
 ## Not implemented in Milestone 1
 

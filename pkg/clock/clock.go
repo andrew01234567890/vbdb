@@ -1,7 +1,9 @@
 // Package clock provides an injectable wall clock and timer abstraction. The
-// manual implementation is deterministic and safe for concurrent test code;
-// production code should receive a Clock explicitly rather than using a
-// process-global test hook.
+// module pins Go's synchronous timer-channel semantics with
+// godebug asynctimerchan=0; an operator-level GODEBUG override is outside this
+// package's contract. The manual implementation is deterministic and safe for
+// concurrent test code; production code should receive a Clock explicitly
+// rather than using a process-global test hook.
 package clock
 
 import (

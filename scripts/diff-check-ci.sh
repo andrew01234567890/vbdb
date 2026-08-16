@@ -157,12 +157,14 @@ while IFS= read -r commit; do
 		# inherited from one parent. Git's combined --check mode still reports
 		# some inherited errors, so the exact all-parent-added-line parser below
 		# is the merge check. Per-commit checks catch every ordinary patch.
-		if ! git -C "$root" diff-tree --cc --unified=0 -r --no-commit-id --no-color "$commit" >"$merge_diff"; then
+		if ! git -C "$root" diff-tree --cc --unified=1 -r --no-commit-id --no-color "$commit" >"$merge_diff"; then
 			die 'unable to inspect combined merge diff'
 		fi
 		# Git's combined --check mode does not report trailing whitespace on
 		# lines marked as a resolution. Inspect only added combined lines;
-		# inherited lines are absent from this diff and therefore ignored.
+		# inherited lines are absent from this diff and therefore ignored. One
+		# context line is retained so an added blank that ends a mid-file change
+		# is not confused with a blank at end-of-file.
 		plus_prefix=$(printf '%*s' "$parent_count" '' | tr ' ' '+')
 		LC_ALL=C awk -v prefix="$plus_prefix" '
 			$0 ~ /^diff --cc / {

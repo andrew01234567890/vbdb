@@ -62,6 +62,14 @@ candidate while staging (a miss is 412), but cannot erase or weaken the
 committed-state baseline. A first blind PUT establishes a blind committed-state
 baseline; a later If-Match(candidate) can validate the private candidate for
 staging but does not convert that original baseline into a conditional write.
+Read-committed statements prohibit G1 dirty reads, intermediate reads, and
+circular information-flow observations: a statement observes only committed
+state and never a partial transaction. Statement-to-statement nonrepeatable
+reads and phantoms are allowed, as are write skew and other anomalies not
+excluded by read committed. Blind last-writer-wins intentionally permits a
+concurrent lost update; an `If-Match` precondition is checked again at the
+serialized commit transition to request conflict detection when the caller
+chooses it.
 Autocommit preconditions and uniqueness validate in one serialized write
 transition; transactional committed-state OCC and uniqueness validate only in
 the replicated prepare/COMMIT transition. The configurable deadline defaults
@@ -95,8 +103,10 @@ authoritative only after an `EXPIRED` entry is applied.
 A client-requested `ROLLED_BACK` decision uses the same deadline authority:
 `latest < deadline` is required, `earliest >= deadline` chooses `EXPIRED`, and
 an interval that straddles the deadline or has no bound leaves the transaction
-`OPEN` with retryable 503. The comparison and terminal state are one consensus
-transition, so rollback after expiry cannot report success.
+in its current non-terminal `OPEN` or `PREPARING` state with retryable 503. No
+uncertainty path may move `PREPARING` back to `OPEN`. The comparison and
+terminal state are one consensus transition, so rollback after expiry cannot
+report success.
 Creation returns 201, a committed or rolled-back operation is 200, and an
 unknown transaction is 404. Repeating the same terminal operation is
 idempotent; a conflicting terminal operation returns 409 and leaves the
@@ -141,6 +151,13 @@ until every fragment is enumerable through the fenced frontier, assembles one
 complete logical event, and only then emits it. Consumer deduplication therefore
 cannot drop mutation fragments. One logical committed transaction yields one
 event even when it spans ranges.
+Each range's `W` is a durable, replicated monotonic value: after restart or
+leader change, a replacement leader may advertise only the last durably
+validated frontier or a later one justified by the same journal evidence, never
+a locally remembered value. `W` stays strictly below any position whose prepare
+or commit decision is unresolved. The range cannot advance `W` through that
+position until the decision and every required participant fragment are durably
+resolved and enumerable, so a late `<= W` event cannot appear after recovery.
 Idle ranges advance their closed frontier with durable heartbeat records, not
 with an unproven wall-clock assumption. The merger's range membership is fenced
 by a catalog generation: a split child joins only after its creation frontier

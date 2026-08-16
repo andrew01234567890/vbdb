@@ -18,8 +18,8 @@ func TestFormatV1GoldenVectors(t *testing.T) {
 		components []Component
 	}{
 		{name: "empty tuple", hexEncoded: "0100"},
-		{name: "empty bytes", hexEncoded: "0101000000", components: []Component{Bytes(nil)}},
-		{name: "zero escaped bytes", hexEncoded: "010100ff000000", components: []Component{Bytes([]byte{0})}},
+		{name: "empty bytes", hexEncoded: "0101000000", components: []Component{mustBytes(t, nil)}},
+		{name: "zero escaped bytes", hexEncoded: "010100ff000000", components: []Component{mustBytes(t, []byte{0})}},
 		{name: "zero escaped string", hexEncoded: "01026100ff62000000", components: []Component{text}},
 		{name: "signed minimum", hexEncoded: "0103000000000000000000", components: []Component{Int64(math.MinInt64)}},
 		{name: "signed negative one", hexEncoded: "01037fffffffffffffff00", components: []Component{Int64(-1)}},
@@ -78,4 +78,9 @@ func mustString(t *testing.T, value string) Component {
 		t.Fatal(err)
 	}
 	return component
+}
+
+func mustBytes(t *testing.T, value []byte) Component {
+	t.Helper()
+	return Bytes(value)
 }

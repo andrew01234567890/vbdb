@@ -11,7 +11,8 @@ func TestTupleRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Component{Bytes([]byte{0, 1, 255}), name, Int64(math.MinInt64), Uint64(math.MaxUint64), Bool(true), Bool(false)}
+	bytesComponent := Bytes([]byte{0, 1, 255})
+	want := []Component{bytesComponent, name, Int64(math.MinInt64), Uint64(math.MaxUint64), Bool(true), Bool(false)}
 	encoded, err := EncodeTuple(want...)
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +176,8 @@ func TestTupleResourceBounds(t *testing.T) {
 	}
 
 	plain := bytes.Repeat([]byte{'a'}, MaxTupleBytes-5)
-	encoded, err = EncodeTuple(Bytes(plain))
+	plainComponent := Bytes(plain)
+	encoded, err = EncodeTuple(plainComponent)
 	if err != nil || len(encoded) != MaxTupleBytes {
 		t.Fatalf("plain tuple boundary: len=%d err=%v", len(encoded), err)
 	}
@@ -184,7 +186,8 @@ func TestTupleResourceBounds(t *testing.T) {
 	}
 	escaped := bytes.Repeat([]byte{'a'}, MaxTupleBytes-6)
 	escaped[MaxTupleBytes/2] = 0
-	encoded, err = EncodeTuple(Bytes(escaped))
+	escapedComponent := Bytes(escaped)
+	encoded, err = EncodeTuple(escapedComponent)
 	if err != nil || len(encoded) != MaxTupleBytes {
 		t.Fatalf("escaped tuple boundary: len=%d err=%v", len(encoded), err)
 	}
@@ -193,6 +196,10 @@ func TestTupleResourceBounds(t *testing.T) {
 	}
 	if _, err := DecodeTuple(append(encoded, 0)); err == nil {
 		t.Fatal("DecodeTuple accepted an over-limit tuple")
+	}
+	tooMuchEscaping := Component{kind: BytesKind, data: bytes.Repeat([]byte{0}, MaxTupleBytes-5)}
+	if _, err := EncodeTuple(tooMuchEscaping); err == nil {
+		t.Fatal("EncodeTuple accepted a component whose zero escapes exceed the tuple limit")
 	}
 }
 
@@ -206,6 +213,32 @@ func TestConstructorsCopyByteSlices(t *testing.T) {
 	}
 	if got[0] != 1 {
 		t.Fatalf("constructor retained mutable input: %v", got)
+	}
+}
+
+func TestConstructorsRejectOversizedVariableComponentsBeforeCopy(t *testing.T) {
+	tooLarge := make([]byte, MaxTupleBytes)
+	if _, err := BytesChecked(tooLarge); err == nil {
+		t.Fatal("Bytes accepted a source that cannot fit a tuple")
+	}
+	if _, err := Bytes(tooLarge).Bytes(); err == nil {
+		t.Fatal("legacy Bytes constructor returned a usable oversized component")
+	}
+	if _, err := String(string(tooLarge)); err == nil {
+		t.Fatal("String accepted a source that cannot fit a tuple")
+	}
+	if _, err := BytesChecked(bytes.Repeat([]byte{0}, MaxTupleBytes-5)); err == nil {
+		t.Fatal("Bytes accepted a source whose zero escapes cannot fit a tuple")
+	}
+}
+
+func TestEncodeRejectsOversizedComponentBeforeTraversingData(t *testing.T) {
+	// This Component is intentionally assembled inside package codec to model a
+	// caller bypassing the constructors. The encoder must reject its impossible
+	// raw length before walking or copying the data.
+	component := Component{kind: BytesKind, data: make([]byte, MaxTupleBytes+1)}
+	if _, err := EncodeTuple(component); err == nil {
+		t.Fatal("EncodeTuple accepted an oversized component")
 	}
 }
 

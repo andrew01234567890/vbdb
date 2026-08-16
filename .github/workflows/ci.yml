@@ -20,6 +20,8 @@ jobs:
           cache: true
       - name: Verify formatting
         run: make fmt-check
+      - name: Formatting self-test
+        run: make fmt-check-selftest
       - name: Vet
         run: make vet
       - name: Unit tests
@@ -30,8 +32,8 @@ jobs:
         run: make public-check
       - name: Public-repository safety self-test
         run: make public-check-selftest
-      - name: Diff check
-        run: make diff-check
+      - name: Committed diff-check self-test
+        run: make diff-check-selftest
       - name: Committed diff check
         env:
           VBDB_EVENT_NAME: ${{ github.event_name }}

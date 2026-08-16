@@ -23,6 +23,11 @@ var numberPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[
 // finite before encoding/json is asked to marshal the decoded value.
 const MaxDepth = 128
 
+// MaxDocumentBytes is the largest JSON document accepted by Parse. Bounding
+// the raw input before tokenization limits decoder, validation, and
+// canonicalization work in addition to the nesting bound.
+const MaxDocumentBytes = 1 << 20
+
 // Document is a validated JSON document and its deterministic representation.
 // The decoded value retains every number as json.Number, never float64.
 type Document struct {
@@ -33,6 +38,9 @@ type Document struct {
 // Parse validates input, rejects duplicate object keys and trailing data, and
 // returns a lossless canonical document.
 func Parse(input []byte) (Document, error) {
+	if len(input) > MaxDocumentBytes {
+		return Document{}, fmt.Errorf("jsondoc: document exceeds %d bytes", MaxDocumentBytes)
+	}
 	if !utf8.Valid(input) {
 		return Document{}, errors.New("jsondoc: input is not valid UTF-8")
 	}
@@ -107,7 +115,7 @@ func parseValue(decoder *json.Decoder, depth int) (any, error) {
 		}
 	case json.Number:
 		if !numberPattern.MatchString(token.String()) {
-			return nil, fmt.Errorf("unsupported number form %q", token.String())
+			return nil, errors.New("unsupported number form")
 		}
 		return token, nil
 	case string, bool, nil:
@@ -129,7 +137,7 @@ func parseObject(decoder *json.Decoder, depth int) (map[string]any, error) {
 			return nil, fmt.Errorf("object key is %T, not string", token)
 		}
 		if _, exists := object[key]; exists {
-			return nil, fmt.Errorf("duplicate object key %q", key)
+			return nil, errors.New("duplicate object key")
 		}
 		value, err := parseValue(decoder, depth)
 		if err != nil {

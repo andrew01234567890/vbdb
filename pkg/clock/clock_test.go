@@ -34,6 +34,17 @@ func TestRealClockNowTimerAndStop(t *testing.T) {
 	}
 }
 
+func TestRealTimerChannelSemanticsArePinned(t *testing.T) {
+	// The module's godebug directive makes this synchronous (cap 0). Running
+	// this package with GODEBUG=asynctimerchan=1 intentionally fails here and
+	// in the unread-expiration parity tests; that override is operator-owned.
+	timer := Real{}.NewTimer(time.Hour)
+	defer timer.Stop()
+	if got := cap(timer.C()); got != 0 {
+		t.Fatalf("real timer channel capacity = %d, want synchronous capacity 0", got)
+	}
+}
+
 func TestRealAndManualUnreadExpiredStopParity(t *testing.T) {
 	manual := NewManual(time.Unix(100, 0))
 	manualTimer := manual.NewTimer(time.Second)

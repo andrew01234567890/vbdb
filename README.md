@@ -15,6 +15,7 @@ they do not claim to be a usable database.
 
 ```sh
 make fmt-check
+make fmt-check-selftest
 make vet
 make test
 make race
@@ -55,10 +56,15 @@ milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.m
 `make public-check` scans every commit reachable from local refs (plus a
 detached `HEAD`), raw commit and annotated-tag objects/ref names, stage-zero
 index blobs, and current tracked/non-ignored intended files for high-risk
-artifact names and credential/private-key signatures. It reports safe source
-identities and categories only; credential-shaped, high-risk, or unsafe paths
-are digested and matching contents are never printed. It rejects shallow
-history, grafts, gitlinks, and repository-selection overrides. `make
+artifact names (including kubeconfig, `.kube`/`.docker` trees, `.netrc`,
+`.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.htpasswd`, `.dockercfg`,
+and Terraform state) and
+credential/private-key signatures. This policy is deliberately fail-safe:
+harmless fixtures under risky names are rejected too, with no unsafe
+suppression mechanism; use explicitly safe example names. It reports safe
+source identities and categories only; credential-shaped, high-risk, or
+unsafe paths are digested and matching contents are never printed. It rejects
+shallow history, grafts, gitlinks, and repository-selection overrides. `make
 public-check-selftest` exercises binary data, ref/history/index/worktree path
 coverage, commit/tag metadata, replacement-object and graft immunity, shallow
 history rejection, gitlink rejection, hostile environment redirection, and
@@ -75,5 +81,5 @@ from `origin` when a force-push predecessor is not present locally; non-fast-
 forward or unrelated push histories safely fall back to the full new head
 history, and branch deletion events are skipped because they introduce no
 content. `make diff-check-selftest` covers introduced-then-removed whitespace,
-merge resolution checking, exact fetch, force-push fallback, and divergent
-pull-request bases.
+merge resolution checking (including a legal mid-file blank and a true blank
+at EOF), exact fetch, force-push fallback, and divergent pull-request bases.

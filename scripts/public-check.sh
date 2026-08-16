@@ -175,10 +175,26 @@ assignment_forbidden="${assignment_forbidden}]"
 assignment_value="${assignment_value}${assignment_forbidden}"
 assignment_value="${assignment_value}[^[:space:]#]{7,}"
 assignment_pattern="${assignment_prefix}${assignment_words}${assignment_suffix}${assignment_equals}${assignment_value}"
-credential_pattern="${pem_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|${pkcs8_key_pattern}|${ssh2_encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|${assignment_pattern}"
+# Credential-bearing configuration is also commonly written as a quoted
+# JSON/YAML key followed by a colon. Keep the key vocabulary explicit and the
+# value bounded; broad matches for words such as "token" create false claims
+# in ordinary public documentation. The fragments are assembled so this
+# scanner source does not contain a complete credential-shaped test string.
+credential_words=$(printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
+	'SECRET' '|PASSWORD' '|PASSWD' '|TOKEN' '|API' '[_-]?KEY' \
+	'|AUTH' '[_-]?TOKEN' '|ACCESS' '[_-]?KEY' '|CLIENT' '[_-]?SECRET' \
+	'|PRIVATE' '[_-]?KEY' '|REGISTRY' '[_-]?PASSWORD')
+credential_key_prefix='(^|[^A-Z0-9_])'
+credential_quote=$(printf '\047')
+credential_key_suffix="[\"${credential_quote}]?[[:space:]]*"
+credential_value="[[:space:]]*[\"${credential_quote}]?[^[:space:]#()\$\\[]{7,}"
+credential_colon_pattern="${credential_key_prefix}[\"${credential_quote}]?(${credential_words})${credential_key_suffix}:${credential_value}"
+credential_pattern="${pem_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|${pkcs8_key_pattern}|${ssh2_encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|${assignment_pattern}|${credential_colon_pattern}"
 
-# These are names, not content matches. Examples and source files remain
-# publishable, while common local credential and private-material paths do not.
+# These are names, not content matches. This is deliberately fail-safe: a
+# harmless fixture under a credential-shaped name is rejected too, and its
+# path is reported only by digest. Examples should use an explicitly safe name
+# such as .env.example; do not add suppressions for a risky basename.
 is_high_risk_name() {
 	local path=$1
 	local base=${path##*/}
@@ -186,7 +202,7 @@ is_high_risk_name() {
 	lower_path=${path,,}
 	lower_base=${base,,}
 	case "$lower_path" in
-		secrets/*|private/*|credentials/*|.codex/*|.claude/*|.aws/*|.ssh/*|.kube/*|*/secrets/*|*/private/*|*/credentials/*|*/.codex/*|*/.claude/*|*/.aws/*|*/.ssh/*|*/.kube/*)
+		secrets/*|private/*|credentials/*|.codex/*|.claude/*|.aws/*|.ssh/*|.kube/*|.docker/*|*/secrets/*|*/private/*|*/credentials/*|*/.codex/*|*/.claude/*|*/.aws/*|*/.ssh/*|*/.kube/*|*/.docker/*)
 			return 0
 			;;
 	esac
@@ -197,7 +213,7 @@ is_high_risk_name() {
 				*) return 0 ;;
 			esac
 			;;
-		*.pem|*.key|*.p12|*.pfx|*.jks|*.p8|id_rsa|id_rsa.*|id_ed25519|id_ed25519.*|id_ecdsa|id_ecdsa.*|id_dsa|id_dsa.*|credentials|credentials.json|credentials.yml|credentials.yaml|secret|secrets)
+		*.pem|*.key|*.p12|*.pfx|*.jks|*.p8|*.tfstate|*.tfstate.*|id_rsa|id_rsa.*|id_ed25519|id_ed25519.*|id_ecdsa|id_ecdsa.*|id_dsa|id_dsa.*|credentials|credentials.json|credentials.yml|credentials.yaml|secret|secrets|.netrc|.git-credentials|.npmrc|.pypirc|.pgpass|.htpasswd|.dockercfg|kubeconfig|kubeconfig.*|*.kubeconfig)
 			return 0
 		;;
 	esac
@@ -213,9 +229,9 @@ scan_signature() {
 		1) ;;
 		*) return 2 ;;
 	esac
-	# Only the assignment form is case-insensitive; headers, token prefixes,
-	# and other signatures retain their deliberately narrow exact matching.
-	LC_ALL=C grep -E -a -i -q -- "$assignment_pattern" "$file" 2>/dev/null
+	# Configuration-key syntax is case-insensitive; headers and token prefixes
+	# retain their deliberately narrow exact matching.
+	LC_ALL=C grep -E -a -i -q -- "${assignment_pattern}|${credential_colon_pattern}" "$file" 2>/dev/null
 	return $?
 }
 

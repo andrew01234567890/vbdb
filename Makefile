@@ -1,4 +1,4 @@
-.PHONY: all fmt fmt-check vet test race public-check public-check-selftest diff-check diff-check-ci diff-check-selftest check clean
+.PHONY: all fmt fmt-check fmt-check-selftest vet test race public-check public-check-selftest diff-check diff-check-ci diff-check-selftest check clean
 
 all: check
 
@@ -7,6 +7,9 @@ fmt:
 
 fmt-check:
 	./scripts/fmt-check.sh
+
+fmt-check-selftest:
+	./scripts/fmt-check-selftest.sh
 
 vet:
 	go vet ./...
@@ -32,7 +35,7 @@ diff-check-ci:
 diff-check-selftest:
 	./scripts/diff-check-selftest.sh
 
-check: fmt-check vet test race public-check public-check-selftest diff-check-selftest diff-check
+check: fmt-check fmt-check-selftest vet test race public-check public-check-selftest diff-check-selftest diff-check
 
 clean:
 	rm -rf bin coverage.out

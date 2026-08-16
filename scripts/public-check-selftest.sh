@@ -59,6 +59,14 @@ ssh2_header=$(printf '%s%s%s%s' '---- BEGIN ' 'SSH2 ENCRYPTED ' 'PRIVATE KEY ' '
 lower_assignment_key=$(printf '%s%s' 'secret' '_key')
 lower_assignment_value=$(printf '%s' 'abcdefghijklmnopqrstuvwxyz')
 punct_assignment_value=$(printf '%s%s' '!' 'abcdefghijklmnopqrstuvwxyz')
+colon_key=$(printf '%s' 'password')
+colon_value=$(printf '%s' 'abcdefghijklmnopqrstuvwxyz123456')
+quoted_colon_key=$(printf '%s' 'api_key')
+quoted_colon_value=$(printf '%s' '0123456789abcdef0123456789abcdef')
+netrc_name=$(printf '%s%s' '.' 'netrc')
+git_credentials_name=$(printf '%s%s' '.git-' 'credentials')
+npmrc_name=$(printf '%s%s' '.' 'npmrc')
+pypirc_name=$(printf '%s%s' '.' 'pypirc')
 unsafe_newline=$(printf 'unsafe\npath.txt')
 unsafe_tab=$(printf 'unsafe\tpath.txt')
 unsafe_escape=$(printf 'unsafe\033path.txt')
@@ -82,6 +90,8 @@ printf '%s\n' "$pkcs8_header" > "$fixture/forms/pkcs8.txt"
 printf '%s\n' "$ssh2_header" > "$fixture/forms/ssh2.txt"
 printf '%s=%s\n' "$lower_assignment_key" "$lower_assignment_value" > "$fixture/forms/lowercase-assignment.txt"
 printf '%s=%s\n' "$lower_assignment_key" "$punct_assignment_value" > "$fixture/forms/punctuation-assignment.txt"
+printf '%s: %s\n' "$colon_key" "$colon_value" > "$fixture/forms/colon-credential.txt"
+printf '"%s": "%s"\n' "$quoted_colon_key" "$quoted_colon_value" > "$fixture/forms/quoted-colon-credential.txt"
 printf '%s\n' "$ghp_token" > "$fixture/forms/ghp.txt"
 printf '%s\n' "$gho_token" > "$fixture/forms/gho.txt"
 printf '%s\n' "$ghu_token" > "$fixture/forms/ghu.txt"
@@ -89,6 +99,10 @@ printf '%s\n' "$ghs_token" > "$fixture/forms/ghs.txt"
 printf '%s\n' "$ghr_token" > "$fixture/forms/ghr.txt"
 printf '%s\n' "$marker_prefix$marker_suffix" > "$scanner_repo/$aws_path"
 printf '%s\n' "$ghp_token" > "$scanner_repo/$github_path"
+printf '%s\n' 'machine example.invalid login public-check password fixture' > "$scanner_repo/$netrc_name"
+printf '%s\n' 'https://user:fixture@example.invalid/repository.git' > "$scanner_repo/$git_credentials_name"
+printf '%s\n' '//registry.example.invalid/:_authToken=fixture' > "$scanner_repo/$npmrc_name"
+printf '%s\n' '[distutils]\nindex-servers =\n    fixture' > "$scanner_repo/$pypirc_name"
 
 set +e
 output=$("$scanner_repo/scripts/public-check.sh" 2>&1)
@@ -113,7 +127,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for form in pgp encrypted pkcs8 ssh2 lowercase-assignment punctuation-assignment ghp gho ghu ghs ghr; do
+for form in pgp encrypted pkcs8 ssh2 lowercase-assignment punctuation-assignment colon-credential quoted-colon-credential ghp gho ghu ghs ghr; do
 	case "$output" in
 		*"forms/$form.txt"*) ;;
 		*)
@@ -122,6 +136,20 @@ for form in pgp encrypted pkcs8 ssh2 lowercase-assignment punctuation-assignment
 			;;
 	esac
 done
+for artifact in "$netrc_name" "$git_credentials_name" "$npmrc_name" "$pypirc_name"; do
+	case "$output" in
+		*"$artifact"*)
+			printf 'public-check-selftest: credential artifact path %s leaked\n' "$artifact" >&2
+			exit 1
+			;;
+		*) ;;
+	esac
+done
+artifact_findings=$(LC_ALL=C grep -F -c 'high-risk private artifact filename' <<<"$output" || true)
+if [ "$artifact_findings" -lt 4 ]; then
+	printf '%s\n' 'public-check-selftest: common credential artifact filenames were not all rejected' >&2
+	exit 1
+fi
 case "$output" in
 	*'PATH:WORKTREE:'*) ;;
 	*)
@@ -143,7 +171,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$pkcs8_header" "$ssh2_header" "$lower_assignment_key=$lower_assignment_value" "$lower_assignment_key=$punct_assignment_value" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
+for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$pkcs8_header" "$ssh2_header" "$lower_assignment_key=$lower_assignment_value" "$lower_assignment_key=$punct_assignment_value" "$colon_key: $colon_value" "$quoted_colon_key: $quoted_colon_value" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
 	case "$output" in
 		*"$secret"*)
 			printf '%s\n' 'public-check-selftest: detector leaked fixture contents' >&2
@@ -577,6 +605,15 @@ mkdir -p "$isolated/scripts"
 cp "$root/scripts/public-check.sh" "$isolated/scripts/public-check.sh"
 mkdir -p "$isolated/deploy/.kube"
 printf '%s\n' 'safe fixture' > "$isolated/deploy/.kube/config"
+printf '%s\n' 'safe fixture' > "$isolated/kubeconfig"
+printf '%s\n' 'safe fixture' > "$isolated/cluster.kubeconfig"
+printf '%s\n' 'safe fixture' > "$isolated/.pgpass"
+printf '%s\n' 'safe fixture' > "$isolated/.htpasswd"
+printf '%s\n' 'safe fixture' > "$isolated/.dockercfg"
+printf '%s\n' 'safe fixture' > "$isolated/terraform.tfstate"
+printf '%s\n' 'safe fixture' > "$isolated/terraform.tfstate.backup"
+mkdir -p "$isolated/.docker"
+printf '%s\n' 'safe fixture' > "$isolated/.docker/config.json"
 printf '%s\n' 'safe fixture' > "$isolated/id_rsa"
 printf '%s\n' 'safe fixture' > "$isolated/secret.go"
 printf '%s\n' 'safe fixture' > "$isolated/secrets.go"
@@ -599,7 +636,7 @@ printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_escape"
 printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_bidi"
 printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_unicode"
 git -C "$isolated" init -q
-git -C "$isolated" add scripts/public-check.sh deploy/.kube/config id_rsa secret.go secrets.go credentials.go .env.sample .env.template id_ecdsa id_dsa encrypted.p8 Deploy/.KUBE/Config ID_RSA Secrets PRIVATE/Thing -- "$unsafe_newline" "$unsafe_tab" "$unsafe_escape" "$unsafe_bidi"
+git -C "$isolated" add scripts/public-check.sh deploy/.kube/config kubeconfig cluster.kubeconfig .pgpass .htpasswd .dockercfg terraform.tfstate terraform.tfstate.backup .docker/config.json id_rsa secret.go secrets.go credentials.go .env.sample .env.template id_ecdsa id_dsa encrypted.p8 Deploy/.KUBE/Config ID_RSA Secrets PRIVATE/Thing -- "$unsafe_newline" "$unsafe_tab" "$unsafe_escape" "$unsafe_bidi"
 printf '\n# %s%s\n' "$marker_prefix" "$marker_suffix" >> "$isolated/scripts/public-check.sh"
 set +e
 output=$("$isolated/scripts/public-check.sh" 2>&1)
@@ -631,16 +668,16 @@ case "$output" in
 		;;
 esac
 high_risk_count=$(LC_ALL=C grep -F -c 'high-risk private artifact filename' <<<"$output" || true)
-if [ "$high_risk_count" -lt 9 ]; then
+if [ "$high_risk_count" -lt 17 ]; then
 	printf '%s\n' 'public-check-selftest: case-folded/nested high-risk paths were not all detected' >&2
 	exit 1
 fi
 digested_high_risk_count=$(LC_ALL=C grep -E -c 'WORKTREE:[0-9a-f]{64}: high-risk private artifact filename' <<<"$output" || true)
-if [ "$digested_high_risk_count" -lt 9 ]; then
+if [ "$digested_high_risk_count" -lt 17 ]; then
 	printf '%s\n' 'public-check-selftest: high-risk path labels were not uniformly digested' >&2
 	exit 1
 fi
-for path in 'deploy/.kube/config' 'id_rsa' 'id_ecdsa' 'id_dsa' 'encrypted.p8' 'Deploy/.KUBE/Config' 'ID_RSA' 'Secrets' 'PRIVATE/Thing'; do
+for path in 'deploy/.kube/config' 'kubeconfig' 'cluster.kubeconfig' '.pgpass' '.htpasswd' '.dockercfg' 'terraform.tfstate' 'terraform.tfstate.backup' '.docker/config.json' 'id_rsa' 'id_ecdsa' 'id_dsa' 'encrypted.p8' 'Deploy/.KUBE/Config' 'ID_RSA' 'Secrets' 'PRIVATE/Thing'; do
 	case "$output" in
 		*"$path"*)
 			printf 'public-check-selftest: sensitive worktree path %s was not detected or redacted\n' "$path" >&2

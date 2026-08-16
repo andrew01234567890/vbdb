@@ -41,13 +41,44 @@ const (
 type Component struct {
 	kind Kind
 	data []byte
+	err  error
 }
 
+// Bytes constructs a byte component while retaining the original one-return
+// API. If value cannot fit, the returned component is invalid: its accessors
+// and EncodeTuple report the bounded-size error, and no caller-owned bytes are
+// copied. New code that needs immediate constructor feedback can use
+// BytesChecked.
 func Bytes(value []byte) Component {
-	return Component{kind: BytesKind, data: append([]byte(nil), value...)}
+	component, err := bytesChecked(value)
+	if err != nil {
+		return Component{kind: BytesKind, err: err}
+	}
+	return component
+}
+
+// BytesChecked is the error-returning form of Bytes for callers that want to
+// reject an invalid component before assembling a tuple.
+func BytesChecked(value []byte) (Component, error) {
+	return bytesChecked(value)
+}
+
+func bytesChecked(value []byte) (Component, error) {
+	// A variable component always needs one kind byte, its 00 00 component
+	// terminator, and the final tuple terminator in addition to its source
+	// bytes. Reject an impossible source length before copying caller-owned
+	// memory. EncodeTuple repeats the same bounded check for multi-component
+	// tuples and internally assembled Components.
+	if err := checkVariableBytesBudget(1, value); err != nil {
+		return Component{}, fmt.Errorf("codec: bytes component cannot fit in %d-byte tuple", MaxTupleBytes)
+	}
+	return Component{kind: BytesKind, data: append([]byte(nil), value...)}, nil
 }
 
 func String(value string) (Component, error) {
+	if err := checkVariableStringBudget(1, value); err != nil {
+		return Component{}, fmt.Errorf("codec: string component cannot fit in %d-byte tuple", MaxTupleBytes)
+	}
 	if !utf8.ValidString(value) {
 		return Component{}, errors.New("codec: string is not valid UTF-8")
 	}
@@ -76,6 +107,9 @@ func Bool(value bool) Component {
 func (c Component) Kind() Kind { return c.kind }
 
 func (c Component) Bytes() ([]byte, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
 	if c.kind != BytesKind {
 		return nil, fmt.Errorf("codec: component is %s, not bytes", c.kind)
 	}
@@ -154,18 +188,26 @@ func EncodeTuple(components ...Component) ([]byte, error) {
 	}
 	encoded := []byte{formatVersion}
 	for _, component := range components {
+		// Check the raw component size before validation or any append. This is
+		// important for a malformed/internally constructed Component whose data
+		// is much larger than the remaining tuple budget: do not traverse or
+		// copy that data merely to discover that the tuple cannot fit.
+		if err := checkComponentBudget(len(encoded), component); err != nil {
+			return nil, err
+		}
 		if err := validate(component); err != nil {
 			return nil, err
 		}
 		encoded = append(encoded, byte(component.kind))
 		switch component.kind {
 		case BytesKind, StringKind:
-			encoded = appendEscaped(encoded, component.data)
+			var err error
+			encoded, err = appendEscapedBounded(encoded, component.data)
+			if err != nil {
+				return nil, err
+			}
 		default:
 			encoded = append(encoded, component.data...)
-		}
-		if len(encoded) > MaxTupleBytes {
-			return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
 		}
 	}
 	encoded = append(encoded, 0)
@@ -225,6 +267,9 @@ func DecodeTuple(encoded []byte) ([]Component, error) {
 }
 
 func validate(c Component) error {
+	if c.err != nil {
+		return c.err
+	}
 	switch c.kind {
 	case BytesKind:
 		return nil
@@ -248,14 +293,78 @@ func validate(c Component) error {
 	}
 }
 
-func appendEscaped(dst, source []byte) []byte {
+func checkComponentBudget(encodedLen int, component Component) error {
+	if encodedLen < 1 || encodedLen > MaxTupleBytes {
+		return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	// The kind byte, variable component terminator, and tuple terminator are
+	// present even for an empty value. This lower bound lets us reject an
+	// oversized source before inspecting its bytes; a bounded preflight below
+	// accounts for zero-byte escape expansion without copying it.
+	if component.kind == BytesKind || component.kind == StringKind {
+		return checkVariableBytesBudget(encodedLen, component.data)
+	}
+	componentBytes := len(component.data)
+	if componentBytes > MaxTupleBytes-encodedLen-2 {
+		return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	return nil
+}
+
+func checkVariableBytesBudget(encodedLen int, source []byte) error {
+	if len(source) > MaxTupleBytes-encodedLen-4 {
+		return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	// Preflight zero-escape expansion without growing the output buffer or
+	// copying any source bytes. Stop as soon as the two component terminator
+	// bytes and final tuple terminator no longer fit.
+	encodedLen++ // component kind
 	for _, b := range source {
+		encodedLen++
+		if b == 0 {
+			encodedLen++
+		}
+		if encodedLen > MaxTupleBytes-3 {
+			return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+		}
+	}
+	return nil
+}
+
+func checkVariableStringBudget(encodedLen int, source string) error {
+	if len(source) > MaxTupleBytes-encodedLen-4 {
+		return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	encodedLen++ // component kind
+	for i := 0; i < len(source); i++ {
+		encodedLen++
+		if source[i] == 0 {
+			encodedLen++
+		}
+		if encodedLen > MaxTupleBytes-3 {
+			return fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+		}
+	}
+	return nil
+}
+
+func appendEscapedBounded(dst, source []byte) ([]byte, error) {
+	for _, b := range source {
+		if len(dst) >= MaxTupleBytes-1 {
+			return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+		}
 		dst = append(dst, b)
 		if b == 0 {
+			if len(dst) >= MaxTupleBytes-1 {
+				return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+			}
 			dst = append(dst, 0xff)
 		}
 	}
-	return append(dst, 0, 0)
+	if len(dst) > MaxTupleBytes-3 {
+		return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	return append(dst, 0, 0), nil
 }
 
 func readEscaped(encoded []byte, offset int) ([]byte, int, error) {
@@ -285,4 +394,9 @@ func readEscaped(encoded []byte, offset int) ([]byte, int, error) {
 }
 
 // Equal reports whether two components have identical canonical values.
-func Equal(a, b Component) bool { return a.kind == b.kind && bytes.Equal(a.data, b.data) }
+func Equal(a, b Component) bool {
+	if a.err != nil || b.err != nil {
+		return false
+	}
+	return a.kind == b.kind && bytes.Equal(a.data, b.data)
+}
