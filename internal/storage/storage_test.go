@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,10 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/vbdb/internal/engine"
 	"github.com/andrew01234567890/vbdb/pkg/codec"
 	"github.com/andrew01234567890/vbdb/pkg/uuidv7"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 )
 
 func testGenerator() UUIDGenerator {
@@ -28,6 +27,42 @@ func testGenerator() UUIDGenerator {
 			Now:  func() time.Time { return time.UnixMilli(100) },
 			Rand: bytes.NewReader(bytes.Repeat([]byte{n}, 10)),
 		}.New()
+	}
+}
+
+func rawEngineOpen(t *testing.T, dir string) *engine.Engine {
+	t.Helper()
+	db, err := engine.Open(dir, engine.Options{
+		MaxKeyBytes:   maxHistoryKeyBytes,
+		MaxValueBytes: maxRowRecordBytes,
+		MaxBatchOps:   4,
+		MaxBatchBytes: maxStorageBatchBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func rawSet(t *testing.T, db *engine.Engine, key, value []byte) {
+	t.Helper()
+	batch := db.NewBatch()
+	if err := batch.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Apply(&batch); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rawDelete(t *testing.T, db *engine.Engine, key []byte) {
+	t.Helper()
+	batch := db.NewBatch()
+	if err := batch.Delete(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Apply(&batch); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -125,30 +160,61 @@ func TestOpenRejectsSymlinkDataDirectory(t *testing.T) {
 	}
 }
 
-func TestReturnableCommitErrorTerminatestheEngine(t *testing.T) {
+func TestReturnableCommitErrorTerminatesTheEngine(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	seed, err := Open(dir, Options{UUIDGenerator: testGenerator()})
+	faultFS := &failSyncFS{FS: engine.OSFS{}}
+	rowEngine, err := Open(dir, Options{UUIDGenerator: testGenerator(), engineOptions: &engine.Options{FS: faultFS}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := seed.Close(); err != nil {
-		t.Fatal(err)
-	}
-	options := pebble.DefaultOptions()
-	options.ReadOnly = true
-	engine, err := Open(dir, Options{UUIDGenerator: testGenerator(), pebbleOptions: options})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = engine.Put("users", "terminal", []byte(`true`), Condition{})
+	faultFS.fail.Store(true)
+	_, err = rowEngine.Put("users", "terminal", []byte(`true`), Condition{})
 	if err == nil || !errors.Is(err, ErrTerminal) {
 		t.Fatalf("returnable commit error = %v, want ErrTerminal", err)
 	}
-	if _, err := engine.Sequence(); err == nil || !errors.Is(err, ErrTerminal) {
+	if _, err := rowEngine.Sequence(); err == nil || !errors.Is(err, ErrTerminal) {
 		t.Fatalf("Sequence after terminal commit error = %v, want ErrTerminal", err)
 	}
-	if err := engine.Close(); err != nil {
+	if _, err := rowEngine.Get("users", "terminal"); err == nil || !errors.Is(err, ErrTerminal) {
+		t.Fatalf("Get after terminal commit error = %v, want ErrTerminal", err)
+	}
+	if err := rowEngine.Close(); err != nil {
 		t.Fatalf("terminal Close = %v, want idempotent success", err)
+	}
+	// A failed sync may leave either no frame or a complete frame in the
+	// filesystem, but recovery must never expose a partial four-record Put.
+	reopened, err := Open(dir, Options{UUIDGenerator: testGenerator()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	sequence, err := reopened.Sequence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, rowErr := reopened.Get("users", "terminal")
+	if sequence == 0 {
+		if !errors.Is(rowErr, ErrNotFound) {
+			t.Fatalf("failed sync absent row error = %v", rowErr)
+		}
+	} else if sequence != 1 || rowErr != nil || row.Sequence != 1 {
+		t.Fatalf("failed sync partial state = sequence %d row=%#v err=%v", sequence, row, rowErr)
+	}
+	physicalKeys := map[string][]byte{
+		"sequence": mustSequenceKey(),
+		"head":     mustHeadKey("users", "terminal"),
+		"history":  mustHistoryKey("users", "terminal", 1),
+		"index":    mustVersionIndexKey(uuidWithSeedAt(100, 1)),
+	}
+	for name, key := range physicalKeys {
+		value, getErr := reopened.db.Get(key)
+		if sequence == 0 {
+			if !errors.Is(getErr, engine.ErrNotFound) {
+				t.Fatalf("failed sync absent physical %s = %v", name, getErr)
+			}
+		} else if getErr != nil || len(value) == 0 {
+			t.Fatalf("failed sync present physical %s = %v", name, getErr)
+		}
 	}
 }
 
@@ -175,144 +241,43 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestPebbleSyncFailureFailsStop(t *testing.T) {
-	const childEnv = "VBDB_PEBBLE_FAILSTOP_CHILD"
-	if os.Getenv(childEnv) == "1" {
-		dir := os.Getenv("VBDB_PEBBLE_FAILSTOP_DIR")
-		faultFS := &failSyncFS{FS: vfs.Default}
-		options := pebble.DefaultOptions()
-		options.FS = faultFS
-		options.Logger = exitLogger{}
-		engine, err := Open(dir, Options{UUIDGenerator: testGenerator(), pebbleOptions: options})
-		if err != nil {
-			os.Exit(98)
-		}
-		faultFS.fail.Store(true)
-		_, _ = engine.Put("users", "fail-stop", []byte(`{"ok":true}`), Condition{})
-		// A real Pebble WAL/fsync error must not return from Batch.Commit.
-		os.Exit(99)
-	}
-
-	dir := filepath.Join(t.TempDir(), "data")
-	command := exec.Command(os.Args[0], "-test.run=^TestPebbleSyncFailureFailsStop$", "-test.v")
-	command.Env = append(os.Environ(), childEnv+"=1", "VBDB_PEBBLE_FAILSTOP_DIR="+dir)
-	output, err := command.CombinedOutput()
-	if err == nil {
-		t.Fatalf("fail-stop child unexpectedly succeeded; output=%s", output)
-	}
-	exitErr, ok := err.(*exec.ExitError)
-	if !ok || exitErr.ExitCode() != 101 {
-		t.Fatalf("fail-stop child error = %v, output=%s; want Pebble Fatalf exit 101", err, output)
-	}
-
-	reopened, err := Open(dir, Options{UUIDGenerator: testGenerator()})
-	if err != nil {
-		t.Fatalf("reopen after real WAL failure = %v; child output=%s", err, output)
-	}
-	defer reopened.Close()
-	sequence, err := reopened.Sequence()
-	if err != nil {
-		t.Fatal(err)
-	}
-	row, rowErr := reopened.Get("users", "fail-stop")
-	present := sequence != 0
-	if sequence == 0 {
-		if !errors.Is(rowErr, ErrNotFound) {
-			t.Fatalf("all-or-none absent row error = %v", rowErr)
-		}
-	} else if sequence != 1 || rowErr != nil || row.Sequence != 1 {
-		t.Fatalf("all-or-none present state = sequence %d row=%#v err=%v", sequence, row, rowErr)
-	} else {
-		historical, err := reopened.GetAt("users", "fail-stop", 1)
-		if err != nil || historical.Version != row.Version || !bytes.Equal(historical.Value, row.Value) {
-			t.Fatalf("present history = %#v err=%v", historical, err)
-		}
-	}
-
-	// Inspect all physical members as well: a valid reopen above proves the
-	// startup invariants, while this catches a partial head/history/index batch.
-	history, err := historyKey("users", "fail-stop", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	failedVersion := uuidWithSeedAt(100, 1)
-	if present && row.Version != failedVersion {
-		t.Fatalf("present row version = %s, want child version %s", row.Version, failedVersion)
-	}
-	index, err := versionIndexKey(failedVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sequenceKeyBytes, err := sequenceKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, key := range map[string][]byte{
-		"sequence": sequenceKeyBytes,
-		"head":     mustHeadKey("users", "fail-stop"),
-		"history":  history,
-		"index":    index,
-	} {
-		value, closer, getErr := reopened.db.Get(key)
-		if present {
-			if getErr != nil {
-				t.Fatalf("physical %s read = %v", name, getErr)
-			}
-			if closeErr := closer.Close(); closeErr != nil {
-				t.Fatal(closeErr)
-			}
-			if len(value) == 0 {
-				t.Fatalf("physical %s unexpectedly empty", name)
-			}
-		} else if !errors.Is(getErr, pebble.ErrNotFound) {
-			t.Fatalf("physical %s absent-state read = %v", name, getErr)
-		}
-	}
-}
-
-type exitLogger struct{}
-
-func (exitLogger) Infof(string, ...interface{})  {}
-func (exitLogger) Errorf(string, ...interface{}) {}
-func (exitLogger) Fatalf(string, ...interface{}) { os.Exit(101) }
-
 type failSyncFS struct {
-	vfs.FS
+	engine.FS
 	fail atomic.Bool
 }
 
-func (fs *failSyncFS) wrap(name string, file vfs.File) vfs.File {
+func (fs *failSyncFS) wrap(name string, file engine.File) engine.File {
 	return &failSyncFile{File: file, name: name, fs: fs}
 }
 
-func (fs *failSyncFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	file, err := fs.FS.Create(name, category)
+func (fs *failSyncFS) OpenFile(name string, flag int, perm fs.FileMode) (engine.File, error) {
+	file, err := fs.FS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
 	return fs.wrap(name, file), nil
-}
-
-func (fs *failSyncFS) OpenReadWrite(name string, category vfs.DiskWriteCategory, options ...vfs.OpenOption) (vfs.File, error) {
-	file, err := fs.FS.OpenReadWrite(name, category, options...)
-	if err != nil {
-		return nil, err
-	}
-	return fs.wrap(name, file), nil
-}
-
-func (fs *failSyncFS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	file, err := fs.FS.ReuseForWrite(oldname, newname, category)
-	if err != nil {
-		return nil, err
-	}
-	return fs.wrap(newname, file), nil
 }
 
 type failSyncFile struct {
-	vfs.File
+	engine.File
 	name string
 	fs   *failSyncFS
+}
+
+func (file *failSyncFile) TryLock() error {
+	lockable, ok := file.File.(engine.Lockable)
+	if !ok {
+		return errors.New("wrapped file is not lockable")
+	}
+	return lockable.TryLock()
+}
+
+func (file *failSyncFile) Unlock() error {
+	lockable, ok := file.File.(engine.Lockable)
+	if !ok {
+		return errors.New("wrapped file is not lockable")
+	}
+	return lockable.Unlock()
 }
 
 func (file *failSyncFile) Sync() error {
@@ -322,22 +287,8 @@ func (file *failSyncFile) Sync() error {
 	return file.File.Sync()
 }
 
-func (file *failSyncFile) SyncData() error {
-	if file.fs.shouldFail(file.name) {
-		return errors.New("injected WAL fsync failure")
-	}
-	return file.File.SyncData()
-}
-
-func (file *failSyncFile) SyncTo(length int64) (bool, error) {
-	if file.fs.shouldFail(file.name) {
-		return false, errors.New("injected WAL fsync failure")
-	}
-	return file.File.SyncTo(length)
-}
-
 func (fs *failSyncFS) shouldFail(name string) bool {
-	return fs.fail.Load() && strings.HasSuffix(filepath.Base(name), ".log")
+	return fs.fail.Load() && strings.HasSuffix(filepath.Base(name), ".wal")
 }
 
 func TestConcurrentSameVersionExactlyOneSuccess(t *testing.T) {
@@ -460,13 +411,8 @@ func TestOpenRejectsMissingDurableVersionIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := pebble.Open(dir, pebble.DefaultOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Delete(index, pebble.Sync); err != nil {
-		t.Fatal(err)
-	}
+	db := rawEngineOpen(t, dir)
+	rawDelete(t, db, index)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -617,17 +563,12 @@ func TestStartupRejectsStaleHeadAndTypedKeyCorruption(t *testing.T) {
 		if err := engine.Close(); err != nil {
 			t.Fatal(err)
 		}
-		db, err := pebble.Open(dir, pebble.DefaultOptions())
-		if err != nil {
-			t.Fatal(err)
-		}
 		stale, err := encodeRow(recordHead, first.Row)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := db.Set(mustHeadKey("users", "alice"), stale, pebble.Sync); err != nil {
-			t.Fatal(err)
-		}
+		db := rawEngineOpen(t, dir)
+		rawSet(t, db, mustHeadKey("users", "alice"), stale)
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -660,13 +601,8 @@ func TestStartupRejectsStaleHeadAndTypedKeyCorruption(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		db, err := pebble.Open(dir, pebble.DefaultOptions())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := db.Set(badKey, record, pebble.Sync); err != nil {
-			t.Fatal(err)
-		}
+		db := rawEngineOpen(t, dir)
+		rawSet(t, db, badKey, record)
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -698,17 +634,12 @@ func TestStartupRejectsDuplicateHistoricalVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := pebble.Open(dir, pebble.DefaultOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
 	key, err := historyKey("users", "duplicate", second.Row.Sequence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Set(key, duplicate, pebble.Sync); err != nil {
-		t.Fatal(err)
-	}
+	db := rawEngineOpen(t, dir)
+	rawSet(t, db, key, duplicate)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -719,6 +650,30 @@ func TestStartupRejectsDuplicateHistoricalVersion(t *testing.T) {
 
 func mustHeadKey(table, key string) []byte {
 	encoded, err := headKey(table, key)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func mustSequenceKey() []byte {
+	encoded, err := sequenceKey()
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func mustHistoryKey(table, key string, sequence uint64) []byte {
+	encoded, err := historyKey(table, key, sequence)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func mustVersionIndexKey(version uuidv7.UUID) []byte {
+	encoded, err := versionIndexKey(version)
 	if err != nil {
 		panic(err)
 	}
@@ -737,17 +692,12 @@ func TestCorruptSequenceFailsOpen(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := pebble.Open(dir, pebble.DefaultOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
 	sequenceKeyBytes, err := sequenceKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Set(sequenceKeyBytes, []byte("corrupt"), pebble.Sync); err != nil {
-		t.Fatal(err)
-	}
+	db := rawEngineOpen(t, dir)
+	rawSet(t, db, sequenceKeyBytes, []byte("corrupt"))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -773,9 +723,7 @@ func TestLiveReadsRejectImpossibleSequences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := engine.db.Set(mustHeadKey("users", "head"), encoded, pebble.Sync); err != nil {
-			t.Fatal(err)
-		}
+		rawSet(t, engine.db, mustHeadKey("users", "head"), encoded)
 		if _, err := engine.Get("users", "head"); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("live corrupt head = %v, want ErrCorrupt", err)
 		}
@@ -803,9 +751,7 @@ func TestLiveReadsRejectImpossibleSequences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := engine.db.Set(key, encoded, pebble.Sync); err != nil {
-			t.Fatal(err)
-		}
+		rawSet(t, engine.db, key, encoded)
 		if _, err := engine.GetAt("users", "history", 1); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("live corrupt history = %v, want ErrCorrupt", err)
 		}
@@ -827,9 +773,7 @@ func TestLiveReadsRejectImpossibleSequences(t *testing.T) {
 		}
 		copy(encoded[34:38], []byte("nope"))
 		encoded = appendChecksum(encoded[:len(encoded)-4])
-		if err := engine.db.Set(mustHeadKey("users", "json"), encoded, pebble.Sync); err != nil {
-			t.Fatal(err)
-		}
+		rawSet(t, engine.db, mustHeadKey("users", "json"), encoded)
 		if _, err := engine.Get("users", "json"); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("live non-JSON head = %v, want ErrCorrupt", err)
 		}

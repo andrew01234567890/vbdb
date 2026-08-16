@@ -88,7 +88,7 @@ func serveGatewayWithReady(dataDir, listen string, exit func(int), ready func())
 	}
 	shutdown := newShutdownLifecycle(exit)
 	// Register this defer before the storage-close defer below. Deferred calls
-	// run LIFO, so a shutdown timer remains armed while Pebble.Close runs.
+	// run LIFO, so a shutdown timer remains armed while the storage engine closes.
 	defer shutdown.stop()
 	store, err := storage.Open(dataDir, storage.Options{})
 	if err != nil {
@@ -139,7 +139,7 @@ func serveGatewayWithReady(dataDir, listen string, exit func(int), ready func())
 		if shutdownErr != nil {
 			// Shutdown leaves active handlers running when its context expires.
 			// Force-close connections, drain the listener goroutine, and wait for
-			// every handler before the deferred Pebble close.
+			// every handler before the deferred storage-engine close.
 			closeErr := server.Close()
 			listenErr := <-errCh
 			if !waitForTracked(tracked, time.Until(deadline), triggerHardExit) {

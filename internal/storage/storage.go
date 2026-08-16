@@ -9,17 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
+	"github.com/andrew01234567890/vbdb/internal/engine"
 	"github.com/andrew01234567890/vbdb/pkg/codec"
 	"github.com/andrew01234567890/vbdb/pkg/jsondoc"
 	"github.com/andrew01234567890/vbdb/pkg/uuidv7"
-	"github.com/cockroachdb/pebble"
 )
 
 const (
@@ -35,6 +32,9 @@ const (
 	maxHistoryKeyBytes   = 1 + (1 + len("vbdb-version") + 2) + (1 + MaxTableBytes + 2) + (1 + 2*MaxKeyBytes + 2) + (1 + 8) + 1
 	maxRowRecordBytes    = 4 + 1 + 1 + 8 + 16 + 4 + MaxValueBytes + 4
 	maxVersionIndexBytes = 4 + 1 + 1 + 4 + maxHistoryKeyBytes + 16 + 4
+	// Put always contains exactly four records. Keep the request bound
+	// derived from legal storage keys and values rather than the generic limit.
+	maxStorageBatchBytes = 4 * (maxHistoryKeyBytes + maxRowRecordBytes + 16)
 
 	// A collision is extraordinarily unlikely with crypto/rand, but injected
 	// generators and a restarted process can deliberately return one. A small
@@ -68,7 +68,8 @@ var (
 	ErrVersionUsed        = errors.New("storage: UUIDv7 version was already committed")
 )
 
-// Row is an immutable version of a row. Value is always copied from Pebble.
+// Row is an immutable version of a row. Value is always copied from the owned
+// engine.
 type Row struct {
 	Table    string
 	Key      string
@@ -110,14 +111,15 @@ type UUIDGenerator func() (uuidv7.UUID, error)
 // Options configures Open.
 type Options struct {
 	UUIDGenerator UUIDGenerator
-	// pebbleOptions is intentionally package-private: tests use Pebble's
-	// supported FS and Logger seams to exercise the real commit boundary.
-	pebbleOptions *pebble.Options
+	// engineOptions is intentionally package-private: same-package tests use
+	// the owned engine's filesystem seam to inject deterministic failures.
+	engineOptions *engine.Options
 }
 
-// Engine is a synchronized single-process storage engine over Pebble.
+// Engine is a synchronized single-process row engine over the owned ordered
+// key/value engine.
 type Engine struct {
-	db          *pebble.DB
+	db          *engine.Engine
 	mu          sync.RWMutex
 	sequence    uint64
 	generate    UUIDGenerator
@@ -131,30 +133,20 @@ func Open(dir string, options Options) (*Engine, error) {
 	if dir == "" {
 		return nil, errors.New("storage: data directory is required")
 	}
-	dir = filepath.Clean(dir)
-	if err := prepareDataDir(dir); err != nil {
-		return nil, err
+	engineOptions := engine.Options{}
+	if options.engineOptions != nil {
+		engineOptions = *options.engineOptions
 	}
-	beforeOpen, err := os.Lstat(dir)
+	// Row records are wrapped in codec tuple keys and storage envelopes. The
+	// generic engine defaults are intentionally too small for these legal
+	// records, so this adapter owns the exact bounds it needs.
+	engineOptions.MaxKeyBytes = maxHistoryKeyBytes
+	engineOptions.MaxValueBytes = maxRowRecordBytes
+	engineOptions.MaxBatchOps = 4
+	engineOptions.MaxBatchBytes = maxStorageBatchBytes
+	db, err := engine.Open(dir, engineOptions)
 	if err != nil {
-		return nil, fmt.Errorf("storage: stat data directory before open: %w", err)
-	}
-	pebbleOptions := pebble.DefaultOptions()
-	if options.pebbleOptions != nil {
-		pebbleOptions = options.pebbleOptions.Clone()
-	}
-	db, err := pebble.Open(dir, pebbleOptions)
-	if err != nil {
-		return nil, fmt.Errorf("storage: open: %w", err)
-	}
-	afterOpen, err := os.Lstat(dir)
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("storage: stat data directory after open: %w", err)
-	}
-	if beforeOpen.Mode()&os.ModeSymlink != 0 || afterOpen.Mode()&os.ModeSymlink != 0 || !os.SameFile(beforeOpen, afterOpen) || (runtime.GOOS != "windows" && afterOpen.Mode().Perm() != 0o700) {
-		_ = db.Close()
-		return nil, fmt.Errorf("%w: data directory identity or mode changed during Pebble open", ErrInsecureDataDir)
+		return nil, mapEngineError("storage: open", err)
 	}
 	sequenceKeyBytes, err := sequenceKey()
 	if err != nil {
@@ -166,21 +158,17 @@ func Open(dir string, options Options) (*Engine, error) {
 		generate = uuidv7.New
 	}
 	e := &Engine{db: db, generate: generate}
-	value, closer, err := db.Get(sequenceKeyBytes)
+	value, err := db.Get(sequenceKeyBytes)
 	if err == nil {
 		sequence, decodeErr := decodeSequence(value)
-		if closeErr := closer.Close(); closeErr != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("storage: read sequence: %w", closeErr)
-		}
 		if decodeErr != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("%w: sequence: %v", ErrCorrupt, decodeErr)
 		}
 		e.sequence = sequence
-	} else if !errors.Is(err, pebble.ErrNotFound) {
+	} else if !errors.Is(err, engine.ErrNotFound) {
 		_ = db.Close()
-		return nil, fmt.Errorf("storage: read sequence: %w", err)
+		return nil, mapEngineError("storage: read sequence", err)
 	} else {
 		hasKeys, scanErr := hasUserKeys(db)
 		if scanErr != nil {
@@ -199,63 +187,19 @@ func Open(dir string, options Options) (*Engine, error) {
 	return e, nil
 }
 
-func prepareDataDir(dir string) error {
-	dir = filepath.Clean(dir)
-	info, err := os.Lstat(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("storage: create data directory: %w", err)
-		}
-		info, err = os.Lstat(dir)
-	}
-	if err != nil {
-		return fmt.Errorf("storage: stat data directory: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s is a symlink", ErrInsecureDataDir, dir)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("storage: data directory is not a directory: %w", ErrInsecureDataDir)
-	}
-	if runtime.GOOS == "windows" {
-		// Windows does not expose Unix owner/group/other permission semantics;
-		// the deployment's ACL policy owns this platform-specific boundary.
-		return nil
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%w: %s has mode %04o", ErrInsecureDataDir, dir, info.Mode().Perm())
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("storage: set data directory permissions: %w", err)
-	}
-	info, err = os.Lstat(dir)
-	if err != nil {
-		return fmt.Errorf("storage: restat data directory: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("%w: %s has mode %04o after chmod", ErrInsecureDataDir, dir, info.Mode().Perm())
-	}
-	return nil
-}
-
-// Close flushes and closes the underlying Pebble database. A close attempt is
-// terminal for this wrapper even when Pebble reports a close error: the
-// underlying database may already be partially closed, so continuing would
-// risk panics or use-after-close. Close is idempotent after that terminal
-// transition.
+// Close closes the underlying owned engine. A close attempt is terminal for
+// this wrapper even when the engine reports a close error: continuing could
+// use a partially closed engine. Close is idempotent after that transition.
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return nil
 	}
-	// Pebble serializes and drains its own commit pipeline in Close. Mark the
-	// wrapper closed only after that call returns so an underlying close error
-	// is not hidden by a state transition performed before the close attempt.
 	closeErr := e.db.Close()
 	e.closed = true
 	if closeErr != nil {
-		return fmt.Errorf("storage: close: %w", closeErr)
+		return mapEngineError("storage: close", closeErr)
 	}
 	return nil
 }
@@ -264,7 +208,7 @@ func (e *Engine) Close() error {
 func (e *Engine) Sequence() (uint64, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.closed {
+	if e.terminalErr != nil || e.closed {
 		return 0, e.stateErr()
 	}
 	return e.sequence, nil
@@ -283,7 +227,7 @@ func (e *Engine) GetAt(table, key string, sequence uint64) (Row, error) {
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.closed {
+	if e.terminalErr != nil || e.closed {
 		return Row{}, e.stateErr()
 	}
 	head, err := e.readHeadLocked(table, key)
@@ -334,7 +278,7 @@ func (e *Engine) Put(table, key string, value []byte, condition Condition) (Writ
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.terminalErr != nil || e.closed {
 		return WriteResult{}, e.stateErr()
 	}
 	head, headErr := e.readHeadLocked(table, key)
@@ -404,48 +348,24 @@ func (e *Engine) Put(table, key string, value []byte, condition Condition) (Writ
 		return WriteResult{}, err
 	}
 	batch := e.db.NewBatch()
-	closeBatchWithError := func(operationErr error) error {
-		if closeErr := batch.Close(); closeErr != nil {
-			return fmt.Errorf("%w (batch close: %v)", operationErr, closeErr)
+	if err := batch.Put(versionKey, versionRecord); err != nil {
+		return WriteResult{}, fmt.Errorf("storage: stage version: %w", err)
+	}
+	if err := batch.Put(headKeyBytes, headRecord); err != nil {
+		return WriteResult{}, fmt.Errorf("storage: stage head: %w", err)
+	}
+	if err := batch.Put(sequenceKeyBytes, sequenceRecord); err != nil {
+		return WriteResult{}, fmt.Errorf("storage: stage sequence: %w", err)
+	}
+	if err := batch.Put(indexKey, versionIndexRecord); err != nil {
+		return WriteResult{}, fmt.Errorf("storage: stage version index: %w", err)
+	}
+	if _, err := e.db.Apply(&batch); err != nil {
+		mapped := mapEngineError("storage: commit", err)
+		if errors.Is(err, engine.ErrPoisoned) {
+			e.terminalErr = mapped
 		}
-		return operationErr
-	}
-	if err := batch.Set(versionKey, versionRecord, nil); err != nil {
-		return WriteResult{}, closeBatchWithError(fmt.Errorf("storage: stage version: %w", err))
-	}
-	if err := batch.Set(headKeyBytes, headRecord, nil); err != nil {
-		return WriteResult{}, closeBatchWithError(fmt.Errorf("storage: stage head: %w", err))
-	}
-	if err := batch.Set(sequenceKeyBytes, sequenceRecord, nil); err != nil {
-		return WriteResult{}, closeBatchWithError(fmt.Errorf("storage: stage sequence: %w", err))
-	}
-	if err := batch.Set(indexKey, versionIndexRecord, nil); err != nil {
-		return WriteResult{}, closeBatchWithError(fmt.Errorf("storage: stage version index: %w", err))
-	}
-	// Pebble's real WAL/fsync failure is fail-stop: DB.Apply invokes its
-	// configured Logger.Fatalf and does not return. This defensive branch only
-	// handles returnable pre-pipeline errors (for example a read-only test DB),
-	// and closes the wrapper so it cannot continue with uncertain state.
-	if err := batch.Commit(pebble.Sync); err != nil {
-		batchCloseErr := batch.Close()
-		terminalErr := fmt.Errorf("%w: %v", ErrTerminal, err)
-		e.closed, e.terminalErr = true, terminalErr
-		closeErr := e.db.Close()
-		if batchCloseErr != nil || closeErr != nil {
-			return WriteResult{}, fmt.Errorf("%w (batch close: %v; close: %v)", terminalErr, batchCloseErr, closeErr)
-		}
-		return WriteResult{}, terminalErr
-	}
-	if err := batch.Close(); err != nil {
-		// The commit has already reached Pebble's synced commit point, but a
-		// batch lifecycle failure means this engine cannot safely continue.
-		terminalErr := fmt.Errorf("%w: committed batch close failed: %v", ErrTerminal, err)
-		e.closed, e.terminalErr = true, terminalErr
-		closeErr := e.db.Close()
-		if closeErr != nil {
-			return WriteResult{}, fmt.Errorf("%w (close: %v)", terminalErr, closeErr)
-		}
-		return WriteResult{}, terminalErr
+		return WriteResult{}, mapped
 	}
 	e.sequence = sequence
 	return WriteResult{Row: row, Created: missing}, nil
@@ -458,22 +378,39 @@ func (e *Engine) stateErr() error {
 	return ErrClosed
 }
 
+func mapEngineError(context string, err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, engine.ErrInvalidDataDir):
+		return fmt.Errorf("%w: %v", ErrInsecureDataDir, err)
+	case errors.Is(err, engine.ErrNotFound):
+		return ErrNotFound
+	case errors.Is(err, engine.ErrClosed):
+		return ErrClosed
+	case errors.Is(err, engine.ErrPoisoned):
+		return fmt.Errorf("%w: %v", ErrTerminal, err)
+	case errors.Is(err, engine.ErrCorrupt):
+		return fmt.Errorf("%w: %v", ErrCorrupt, err)
+	default:
+		return fmt.Errorf("%s: %w", context, err)
+	}
+}
+
 func (e *Engine) versionUsedLocked(version uuidv7.UUID) (bool, error) {
 	key, err := versionIndexKey(version)
 	if err != nil {
 		return false, err
 	}
-	value, closer, err := e.db.Get(key)
-	if errors.Is(err, pebble.ErrNotFound) {
+	value, err := e.db.Get(key)
+	if errors.Is(err, engine.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("storage: read version index: %w", err)
+		return false, mapEngineError("storage: read version index", err)
 	}
 	_, decodeErr := decodeVersionIndex(value, version)
-	if closeErr := closer.Close(); closeErr != nil {
-		return false, fmt.Errorf("storage: close version index read: %w", closeErr)
-	}
 	if decodeErr != nil {
 		return false, fmt.Errorf("%w: version index: %v", ErrCorrupt, decodeErr)
 	}
@@ -485,17 +422,14 @@ func (e *Engine) readHeadLocked(table, key string) (Row, error) {
 	if err != nil {
 		return Row{}, err
 	}
-	value, closer, err := e.db.Get(encodedKey)
-	if errors.Is(err, pebble.ErrNotFound) {
+	value, err := e.db.Get(encodedKey)
+	if errors.Is(err, engine.ErrNotFound) {
 		return Row{}, ErrNotFound
 	}
 	if err != nil {
-		return Row{}, fmt.Errorf("storage: read head: %w", err)
+		return Row{}, mapEngineError("storage: read head", err)
 	}
 	row, decodeErr := decodeRow(value, recordHead)
-	if closeErr := closer.Close(); closeErr != nil {
-		return Row{}, fmt.Errorf("storage: close head read: %w", closeErr)
-	}
 	if decodeErr != nil {
 		return Row{}, fmt.Errorf("%w: head: %v", ErrCorrupt, decodeErr)
 	}
@@ -506,7 +440,7 @@ func (e *Engine) readHeadLocked(table, key string) (Row, error) {
 	return row, nil
 }
 
-func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (row Row, retErr error) {
+func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (Row, error) {
 	prefix, err := historyPrefix(table, key)
 	if err != nil {
 		return Row{}, err
@@ -515,22 +449,14 @@ func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (row Row,
 	if err != nil {
 		return Row{}, err
 	}
-	iter, err := e.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
-	if err != nil {
-		return Row{}, fmt.Errorf("storage: history iterator: %w", err)
-	}
-	defer func() {
-		if closeErr := iter.Close(); closeErr != nil && retErr == nil {
-			retErr = fmt.Errorf("storage: close history iterator: %w", closeErr)
-		}
-	}()
-	if !iter.SeekLT(upper) {
-		if err := iter.Error(); err != nil {
-			return Row{}, fmt.Errorf("storage: history iterator: %w", err)
-		}
+	entry, err := e.db.Last(prefix, upper)
+	if errors.Is(err, engine.ErrNotFound) {
 		return Row{}, ErrNotFound
 	}
-	keyCopy := append([]byte(nil), iter.Key()...)
+	if err != nil {
+		return Row{}, mapEngineError("storage: history iterator", err)
+	}
+	keyCopy := append([]byte(nil), entry.Key...)
 	components, decodeErr := codec.DecodeTuple(keyCopy)
 	if decodeErr != nil || len(components) != 4 {
 		return Row{}, fmt.Errorf("%w: history key", ErrCorrupt)
@@ -541,11 +467,7 @@ func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (row Row,
 	if tableErr != nil || keyErr != nil || sequenceErr != nil || storedTable != table || storedKey != key || storedSequence == 0 || storedSequence > sequence || storedSequence > e.sequence {
 		return Row{}, fmt.Errorf("%w: history key coordinates", ErrCorrupt)
 	}
-	value, valueErr := iter.ValueAndErr()
-	if valueErr != nil {
-		return Row{}, fmt.Errorf("storage: read history: %w", valueErr)
-	}
-	decoded, rowErr := decodeRow(value, recordVersion)
+	decoded, rowErr := decodeRow(entry.Value, recordVersion)
 	if rowErr != nil {
 		return Row{}, fmt.Errorf("%w: history value: %v", ErrCorrupt, rowErr)
 	}
@@ -553,9 +475,6 @@ func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (row Row,
 		return Row{}, fmt.Errorf("%w: history key/value sequence mismatch", ErrCorrupt)
 	}
 	decoded.Table, decoded.Key = table, key
-	if err := iter.Error(); err != nil {
-		return Row{}, fmt.Errorf("storage: history iterator: %w", err)
-	}
 	return decoded, nil
 }
 
@@ -803,32 +722,32 @@ func validChecksum(encoded []byte) bool {
 	return crc32.Checksum(encoded[:len(encoded)-4], crcTable) == want
 }
 
-func hasUserKeys(db *pebble.DB) (hasKeys bool, retErr error) {
-	iter, err := db.NewIter(nil)
+func hasUserKeys(db *engine.Engine) (hasKeys bool, retErr error) {
+	stream, err := db.Stream(nil, nil)
 	if err != nil {
-		return false, err
+		return false, mapEngineError("storage: inspect records", err)
 	}
 	defer func() {
-		if closeErr := iter.Close(); closeErr != nil && retErr == nil {
-			retErr = closeErr
+		if closeErr := stream.Close(); closeErr != nil && retErr == nil {
+			retErr = mapEngineError("storage: close record stream", closeErr)
 		}
 	}()
-	hasKeys = iter.First()
-	if err := iter.Error(); err != nil {
-		return false, err
+	_, ok, nextErr := stream.Next()
+	if nextErr != nil {
+		return false, mapEngineError("storage: inspect records", nextErr)
 	}
-	return hasKeys, nil
+	return ok, nil
 }
 
-func validatePersistedRecords(db *pebble.DB, sequence uint64) (retErr error) {
+func validatePersistedRecords(db *engine.Engine, sequence uint64) (retErr error) {
 	// This makes a corrupt historical or version-index record an explicit open
 	// failure rather than allowing it to masquerade as an absent row later.
-	iter, err := db.NewIter(nil)
+	stream, err := db.Stream(nil, nil)
 	if err != nil {
 		return fmt.Errorf("%w: record iterator: %v", ErrCorrupt, err)
 	}
 	defer func() {
-		if closeErr := iter.Close(); closeErr != nil && retErr == nil {
+		if closeErr := stream.Close(); closeErr != nil && retErr == nil {
 			retErr = fmt.Errorf("%w: close record iterator: %v", ErrCorrupt, closeErr)
 		}
 	}()
@@ -846,8 +765,15 @@ func validatePersistedRecords(db *pebble.DB, sequence uint64) (retErr error) {
 	// This set is startup-only integrity state. It deliberately does not live
 	// on Engine; constant-memory restart validation is deferred for M2.
 	seenSequences := make(map[uint64]struct{})
-	for valid := iter.First(); valid; valid = iter.Next() {
-		key := append([]byte(nil), iter.Key()...)
+	for {
+		entry, valid, nextErr := stream.Next()
+		if nextErr != nil {
+			return fmt.Errorf("%w: record iterator: %v", ErrCorrupt, nextErr)
+		}
+		if !valid {
+			break
+		}
+		key := append([]byte(nil), entry.Key...)
 		components, decodeErr := codec.DecodeTuple(key)
 		if decodeErr != nil {
 			return fmt.Errorf("%w: key: %v", ErrCorrupt, decodeErr)
@@ -859,10 +785,7 @@ func validatePersistedRecords(db *pebble.DB, sequence uint64) (retErr error) {
 		if decodeErr != nil {
 			return fmt.Errorf("%w: key kind: %v", ErrCorrupt, decodeErr)
 		}
-		value, valueErr := iter.ValueAndErr()
-		if valueErr != nil {
-			return fmt.Errorf("%w: value: %v", ErrCorrupt, valueErr)
-		}
+		value := entry.Value
 		switch kind {
 		case "vbdb-sequence":
 			if len(components) != 1 {
@@ -904,16 +827,15 @@ func validatePersistedRecords(db *pebble.DB, sequence uint64) (retErr error) {
 			if indexErr != nil {
 				return fmt.Errorf("%w: version index key", ErrCorrupt)
 			}
-			indexValue, indexCloser, indexGetErr := db.Get(indexKey)
-			if errors.Is(indexGetErr, pebble.ErrNotFound) {
+			indexValue, indexGetErr := db.Get(indexKey)
+			if errors.Is(indexGetErr, engine.ErrNotFound) {
 				return fmt.Errorf("%w: history has no version index", ErrCorrupt)
 			}
 			if indexGetErr != nil {
 				return fmt.Errorf("%w: version index read: %v", ErrCorrupt, indexGetErr)
 			}
 			indexHistory, indexDecodeErr := decodeVersionIndex(indexValue, row.Version)
-			indexCloseErr := indexCloser.Close()
-			if indexDecodeErr != nil || indexCloseErr != nil || !bytes.Equal(indexHistory, key) {
+			if indexDecodeErr != nil || !bytes.Equal(indexHistory, key) {
 				return fmt.Errorf("%w: version index mismatch", ErrCorrupt)
 			}
 			keyID := persistedKey{table: table, key: rowKey}
@@ -940,24 +862,20 @@ func validatePersistedRecords(db *pebble.DB, sequence uint64) (retErr error) {
 			if indexErr != nil {
 				return fmt.Errorf("%w: version index value", ErrCorrupt)
 			}
-			historyValue, historyCloser, historyGetErr := db.Get(history)
-			if errors.Is(historyGetErr, pebble.ErrNotFound) {
+			historyValue, historyGetErr := db.Get(history)
+			if errors.Is(historyGetErr, engine.ErrNotFound) {
 				return fmt.Errorf("%w: version index points to missing history", ErrCorrupt)
 			}
 			if historyGetErr != nil {
 				return fmt.Errorf("%w: indexed history read: %v", ErrCorrupt, historyGetErr)
 			}
 			historyRow, historyDecodeErr := decodeRow(historyValue, recordVersion)
-			historyCloseErr := historyCloser.Close()
-			if historyDecodeErr != nil || historyCloseErr != nil || historyRow.Version != version {
+			if historyDecodeErr != nil || historyRow.Version != version {
 				return fmt.Errorf("%w: version index history mismatch", ErrCorrupt)
 			}
 		default:
 			return fmt.Errorf("%w: unknown record kind", ErrCorrupt)
 		}
-	}
-	if err := iter.Error(); err != nil {
-		return fmt.Errorf("%w: record iterator: %v", ErrCorrupt, err)
 	}
 	if (sequence == 0 && len(seenSequences) != 0) || (sequence != 0 && uint64(len(seenSequences)) != sequence) {
 		return fmt.Errorf("%w: sequence coverage mismatch", ErrCorrupt)
