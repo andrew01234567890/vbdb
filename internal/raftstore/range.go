@@ -358,9 +358,55 @@ func (c *RangeCatalog) RouteAt(key []byte, rangeID string, generation, ownerEpoc
 	return current.Clone(), nil
 }
 
-func (c *RangeCatalog) VerifyGeneration(key []byte, descriptor RangeDescriptor) error {
-	_, err := c.RouteAt(key, descriptor.RangeID, descriptor.Generation, descriptor.OwnerEpoch, descriptor.GroupID)
-	return err
+// VerifyGeneration checks a descriptor against the current immutable ID
+// fence. RouteAt additionally checks key containment and serving phase.
+func (c *RangeCatalog) VerifyGeneration(descriptor RangeDescriptor) error {
+	if c == nil {
+		return ErrCatalogCorrupt
+	}
+	if err := descriptor.Validate(); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	old, known := c.history[descriptor.RangeID]
+	if !known {
+		return nil
+	}
+	if _, current := c.byID[descriptor.RangeID]; !current {
+		return ErrCatalogStale
+	}
+	previous := c.byID[descriptor.RangeID]
+	if !bytes.Equal(previous.Start, descriptor.Start) || !bytes.Equal(previous.End, descriptor.End) ||
+		descriptor.Generation < old.Generation || descriptor.OwnerEpoch < old.OwnerEpoch {
+		return ErrCatalogStale
+	}
+	if previous.Phase == RangeRetired && descriptor.Phase != RangeRetired {
+		return ErrCatalogStale
+	}
+	if !validPhaseTransition(previous.Phase, descriptor.Phase) {
+		return ErrCatalogStale
+	}
+	if (previous.GroupID != descriptor.GroupID || !equalUint64(previous.Voters, descriptor.Voters)) && descriptor.OwnerEpoch <= old.OwnerEpoch {
+		return ErrCatalogStale
+	}
+	return nil
+}
+
+// ValidateAgainstVoters binds every current descriptor to the durable local
+// Raft membership before a catalog can become serving authority.
+func (c *RangeCatalog) ValidateAgainstVoters(voters []uint64) error {
+	if c == nil || len(voters) != 3 || voters[0] == 0 || voters[1] <= voters[0] || voters[2] <= voters[1] {
+		return fmt.Errorf("%w: ConfState must contain sorted RF3 voters", ErrRangeInvalid)
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, descriptor := range c.descriptors {
+		if !equalUint64(descriptor.Voters, voters) {
+			return fmt.Errorf("%w: descriptor %s voters differ from ConfState", ErrRangeInvalid, descriptor.RangeID)
+		}
+	}
+	return nil
 }
 
 func (c *RangeCatalog) DescriptorByID(id string) (RangeDescriptor, bool) {

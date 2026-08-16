@@ -42,6 +42,7 @@ const (
 	kResultPre       = "m3/state/result/"
 	kStateMeta       = "m3/state/meta"
 	kStateGeneration = "m3/state/generation"
+	kCatalog         = "m4/catalog/complete"
 	maxSnapshotChunk = 256 << 10
 	maxSnapshotBytes = 64 << 20
 	maxReadyEntries  = 32
@@ -65,6 +66,7 @@ type diskStore struct {
 	hadNodeID           bool
 	bootstrapPeers      []uint64
 	bootstrapIncomplete bool
+	catalogData         []byte
 }
 
 func openDisk(dir string, expectedNodeID uint64, syncFail func(string) error) (*diskStore, error) {
@@ -182,6 +184,20 @@ func (d *diskStore) load(expectedNodeID uint64) error {
 					return d.corrupt("bootstrap peers", nil)
 				}
 			}
+		case bytes.Equal(key, []byte(kCatalog)):
+			payload, err := unwrapDisk(value, 14)
+			if err != nil {
+				return d.corrupt("range catalog", err)
+			}
+			catalog, err := UnmarshalRangeCatalog(payload)
+			if err != nil {
+				return d.corrupt("range catalog", err)
+			}
+			canonical, err := catalog.MarshalBinary()
+			if err != nil || !bytes.Equal(canonical, payload) {
+				return d.corrupt("range catalog canonicality", err)
+			}
+			d.catalogData = append([]byte(nil), payload...)
 		case bytes.Equal(key, []byte(kHardState)):
 			payload, err := unwrapDisk(value, 1)
 			if err != nil {
@@ -498,10 +514,49 @@ func (d *diskStore) confStateCopy() *pb.ConfState {
 	defer d.mu.RUnlock()
 	return proto.Clone(d.confState).(*pb.ConfState)
 }
+
+func (d *diskStore) catalogCopy() []byte {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return append([]byte(nil), d.catalogData...)
+}
 func (d *diskStore) commitIndex() uint64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.hardState.GetCommit()
+}
+
+// persistCatalog writes one complete canonical image through the owned engine
+// before the caller publishes it to the serving catalog pointer. There is no
+// prefix delete or second WAL: the complete value is the durable authority.
+func (d *diskStore) persistCatalog(encoded []byte) error {
+	catalog, err := UnmarshalRangeCatalog(encoded)
+	if err != nil {
+		return err
+	}
+	canonical, err := catalog.MarshalBinary()
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return ErrCatalogCorrupt
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failed != nil {
+		return d.failed
+	}
+	if err := d.beforeSync("range-catalog"); err != nil {
+		d.failed = err
+		return err
+	}
+	b := d.db.NewBatch()
+	if err := b.Put([]byte(kCatalog), wrapDisk(14, encoded)); err != nil {
+		return err
+	}
+	if _, err := d.db.Apply(&b); err != nil {
+		d.failed = fmt.Errorf("raftstore: persist range catalog: %w", err)
+		return d.failed
+	}
+	d.catalogData = append([]byte(nil), encoded...)
+	return nil
 }
 
 func entryKey(index uint64) []byte {
@@ -675,7 +730,7 @@ func isKnownRaftKey(key []byte) bool {
 		bytes.Equal(key, []byte(kConfState)) || bytes.Equal(key, []byte(kConfIndex)) ||
 		bytes.Equal(key, []byte(kSnapshot)) || bytes.HasPrefix(key, []byte(kSnapshotPre)) ||
 		bytes.Equal(key, []byte(kNodeID)) || bytes.Equal(key, []byte(kBootstrap)) ||
-		bytes.HasPrefix(key, []byte(kEntryPre)) || bytes.Equal(key, []byte(kStateGeneration))
+		bytes.HasPrefix(key, []byte(kEntryPre)) || bytes.Equal(key, []byte(kStateGeneration)) || bytes.Equal(key, []byte(kCatalog))
 }
 
 func isAnyLogicalKey(key []byte) bool {
