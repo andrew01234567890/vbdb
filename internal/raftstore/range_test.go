@@ -31,7 +31,7 @@ func TestRangeCatalogRouteFenceCopiesAndGroup(t *testing.T) {
 	if !bytes.Equal(checked.Start, nil) || checked.Voters[0] != 1 {
 		t.Fatalf("catalog leaked mutable route: %+v", checked)
 	}
-	if err := catalog.VerifyGeneration([]byte("k"), checked); err != nil {
+	if err := catalog.VerifyGeneration(checked); err != nil {
 		t.Fatal(err)
 	}
 }
