@@ -112,6 +112,8 @@ type rf3Transport struct {
 	reverse bool
 }
 
+const maxRF3ElectionDrives = 128
+
 func newRF3Transport() *rf3Transport {
 	return &rf3Transport{nodes: make(map[uint64]*Replica), blocked: make(map[[2]uint64]bool)}
 }
@@ -185,35 +187,65 @@ func (t *rf3Transport) drive(nodes ...*Replica) {
 	}
 }
 
-func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
+func (t *rf3Transport) driveUntil(tb testing.TB, maxDrives int, nodes []*Replica, condition func() bool) {
+	tb.Helper()
+	for drive := 0; drive < maxDrives; drive++ {
+		t.drive(nodes...)
+		if condition() {
+			return
+		}
+	}
+	t.mu.Lock()
+	queued := len(t.queue)
+	t.mu.Unlock()
+	statuses := make([]Diagnostic, len(nodes))
+	for i, node := range nodes {
+		statuses[i] = node.Status()
+	}
+	tb.Fatalf("condition not met after %d deterministic drives: statuses=%#v queued=%d", maxDrives, statuses, queued)
+}
+
+func newRF3TestCluster(tb testing.TB) (*rf3Transport, []*Replica) {
+	tb.Helper()
 	transport := newRF3Transport()
 	peers := []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}}
 	nodes := make([]*Replica, 3)
 	for i := range nodes {
-		node, err := Open(Options{ID: uint64(i + 1), Dir: filepath.Join(t.TempDir(), "node"), Peers: peers, Transport: transport, ElectionTick: 100, HeartbeatTick: 1})
+		node, err := Open(Options{ID: uint64(i + 1), Dir: filepath.Join(tb.TempDir(), "node"), Peers: peers, Transport: transport, ElectionTick: 100, HeartbeatTick: 1})
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		nodes[i] = node
 		transport.nodes[uint64(i+1)] = node
 	}
-	defer func() {
+	tb.Cleanup(func() {
 		for _, node := range nodes {
 			_ = node.Close()
 		}
-	}()
+	})
+	return transport, nodes
+}
+
+func TestDeterministicRF3CampaignWaitsForLeader(t *testing.T) {
+	transport, nodes := newRF3TestCluster(t)
 	for i := 0; i < 4; i++ {
 		transport.drive(nodes...)
 	}
 	if err := nodes[0].Campaign(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 12; i++ {
+	transport.driveUntil(t, maxRF3ElectionDrives, nodes, func() bool { return nodes[0].Status().Leader == 1 })
+}
+
+func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
+	transport, nodes := newRF3TestCluster(t)
+	for i := 0; i < 4; i++ {
 		transport.drive(nodes...)
 	}
-	if nodes[0].Status().Leader != 1 {
-		t.Fatalf("node 1 did not lead: %#v", nodes[0].Status())
+	if err := nodes[0].Campaign(context.Background()); err != nil {
+		t.Fatal(err)
 	}
+	transport.driveUntil(t, maxRF3ElectionDrives, nodes, func() bool { return nodes[0].Status().Leader == 1 })
 	command, err := NewPut("users", "rf3", []byte(`{"n":1}`), storage.Condition{}, deterministicUUIDs())
 	if err != nil {
 		t.Fatal(err)
