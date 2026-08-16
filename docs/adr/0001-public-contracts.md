@@ -82,6 +82,18 @@ applying anything, so it cannot clobber a newer write. A request sequence is
 still recorded for transaction history and ordering even when an idempotency
 identity is supplied.
 
+Full-result GC must not make an identity fresh. Before deleting a complete
+dedup result, the replicated state must durably retain bounded anti-reuse
+evidence (for example, a retired identity and request digest) or install a
+durable generation/expiry fence that verifiably excludes delayed retries. A
+retired, expired, or indeterminate identity is rejected without mutation; it
+must never fall through to blind PUT. If anti-reuse admission is exhausted, or
+the evidence/fence cannot be durably established, GC or new admission fails
+closed without acknowledging a mutation. Recovery must restore the evidence
+or fence before accepting writes. Identity reuse is permitted only after a
+durable fence proves that the old identity is safely outside the retry
+ambiguity window.
+
 Every request carrying `X-Transaction-Id` requires the response to include
 `Cache-Control: no-store, private` and `Vary: X-Transaction-Id`, including
 transactional PUT (202), GET/QUERY overlays, and transaction status and

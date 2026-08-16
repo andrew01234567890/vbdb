@@ -33,6 +33,14 @@ logical visibility rules. Global indexes remain separate replicated ranges and
 therefore still require the transaction protocol; a local storage batch cannot
 claim cross-range atomicity.
 
+Deduplication result GC is itself a replicated durability transition. A full
+result may be removed only after the same durable state contains bounded
+anti-reuse evidence or a verifiable generation/expiry fence for that identity;
+recovery must restore that evidence or fence before the replica serves writes.
+Retired, expired, or indeterminate identities are rejected without mutation,
+and exhaustion or uncertainty in anti-reuse admission fails closed rather than
+turning the identity into a fresh blind PUT.
+
 Every write batch is encoded completely before entering the WAL. The engine
 appends a length-bounded CRC32C frame, handles short writes, synchronizes the
 WAL, and only then publishes the batch to memtables and advances its visible
@@ -152,7 +160,10 @@ target quorum, and then perform one fenced metadata cutover. Before that
 cutover the old owner is authoritative; after it only the new owner is. A
 short cutover queue/retry and bounded stale-route forwarding provide no
 client-visible downtime. Operation IDs and replicated deduplication prevent a
-successful PUT from being applied twice during rerouting.
+successful PUT from being applied twice during rerouting. Full-result GC must
+also preserve the durable post-GC anti-reuse evidence or generation fence, so
+a delayed retry after restart cannot be mistaken for a new operation and
+overwrite a later write.
 
 Backups choose one global HLC barrier and publish a manifest only after every
 shard, transaction decision, catalog record, and CDC position is durable. PITR
