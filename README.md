@@ -52,21 +52,28 @@ The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
 milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.md).
 
-`make public-check` scans commits and trees reachable from all local refs (plus
-a detached `HEAD`), raw commit and annotated-tag objects, stage-zero index
-blobs, and current tracked/non-ignored intended files for high-risk artifact
-names and credential/private-key signatures. It reports safe source identities
-and categories only; credential-shaped or high-risk filenames are redacted and
-matching contents are never printed. `make public-check-selftest` exercises
-binary data, ref/history/index/worktree path coverage, commit/tag metadata,
-replace-object immunity, shallow-history rejection, gitlink rejection, and
+`make public-check` scans every commit reachable from local refs (plus a
+detached `HEAD`), raw commit and annotated-tag objects/ref names, stage-zero
+index blobs, and current tracked/non-ignored intended files for high-risk
+artifact names and credential/private-key signatures. It reports safe source
+identities and categories only; credential-shaped, high-risk, or unsafe paths
+are digested and matching contents are never printed. It rejects shallow
+history, grafts, gitlinks, and repository-selection overrides. `make
+public-check-selftest` exercises binary data, ref/history/index/worktree path
+coverage, commit/tag metadata, replacement-object and graft immunity, shallow
+history rejection, gitlink rejection, hostile environment redirection, and
 fail-closed enumeration. All fixtures are created outside the repository in a
-validated temporary directory. It requires a complete non-shallow history and
-disables Git replace refs while scanning. Local environment files, keys,
-credentials, and secret/private directories are ignored by default; committed
-configuration must use a safe example file instead.
+validated temporary directory. It disables Git replace refs while scanning.
+Local environment files, keys, credentials, and secret/private directories are
+ignored by default; committed configuration must use a safe example file
+instead.
 
 `make diff-check` checks the local worktree. CI also runs
 `make diff-check-ci` over the exact event base/head range, checking every
-introduced commit (including an initial push); `make diff-check-selftest`
-covers introduced-then-removed whitespace and divergent pull-request bases.
+introduced commit (including an initial push). CI permits an exact SHA fetch
+from `origin` when a force-push predecessor is not present locally; non-fast-
+forward or unrelated push histories safely fall back to the full new head
+history, and branch deletion events are skipped because they introduce no
+content. `make diff-check-selftest` covers introduced-then-removed whitespace,
+merge resolution checking, exact fetch, force-push fallback, and divergent
+pull-request bases.

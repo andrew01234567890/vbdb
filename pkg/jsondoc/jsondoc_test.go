@@ -59,6 +59,17 @@ func TestRejectsInvalidUTF8TrailingAndUnsupportedNumbers(t *testing.T) {
 	}
 }
 
+func TestTrailingValueErrorDoesNotEchoContent(t *testing.T) {
+	trailing := "gh" + "p_" + "publiccheckfixtureabcdefghijklmnopqrstuvwxyz123456"
+	_, err := Parse([]byte(`1 ` + trailing))
+	if err == nil {
+		t.Fatal("accepted trailing JSON value")
+	}
+	if strings.Contains(err.Error(), trailing) {
+		t.Fatalf("trailing error echoed content: %v", err)
+	}
+}
+
 func TestRejectsUnpairedSurrogateEscapes(t *testing.T) {
 	for _, input := range []string{
 		`{"value":"\ud800"}`,
@@ -111,11 +122,11 @@ func TestPreservesNumericTokenSpellings(t *testing.T) {
 }
 
 func TestCanonicalEscapesHTMLDeterministically(t *testing.T) {
-	canonical, err := Canonicalize([]byte(`{"value":"<&>"}`))
+	canonical, err := Canonicalize([]byte(`{"value":"<&>\u2028\u2029"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"value":"\u003c\u0026\u003e"}`
+	const want = `{"value":"\u003c\u0026\u003e\u2028\u2029"}`
 	if string(canonical) != want {
 		t.Fatalf("canonical HTML escaping = %s, want %s", canonical, want)
 	}

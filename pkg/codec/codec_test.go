@@ -150,6 +150,52 @@ func TestDecodeRejectsMalformedInput(t *testing.T) {
 	}
 }
 
+func TestTupleResourceBounds(t *testing.T) {
+	components := make([]Component, MaxComponents)
+	for i := range components {
+		components[i] = Bool(false)
+	}
+	encoded, err := EncodeTuple(components...)
+	if err != nil {
+		t.Fatalf("max-component tuple: %v", err)
+	}
+	if _, err := DecodeTuple(encoded); err != nil {
+		t.Fatalf("decode max-component tuple: %v", err)
+	}
+	if _, err := EncodeTuple(append(components, Bool(true))...); err == nil {
+		t.Fatal("EncodeTuple accepted too many components")
+	}
+	tooMany := append([]byte{formatVersion}, make([]byte, 0, MaxComponents*2+1)...)
+	for i := 0; i < MaxComponents+1; i++ {
+		tooMany = append(tooMany, byte(BoolKind), 0)
+	}
+	tooMany = append(tooMany, 0)
+	if _, err := DecodeTuple(tooMany); err == nil {
+		t.Fatal("DecodeTuple accepted too many components")
+	}
+
+	plain := bytes.Repeat([]byte{'a'}, MaxTupleBytes-5)
+	encoded, err = EncodeTuple(Bytes(plain))
+	if err != nil || len(encoded) != MaxTupleBytes {
+		t.Fatalf("plain tuple boundary: len=%d err=%v", len(encoded), err)
+	}
+	if _, err := DecodeTuple(encoded); err != nil {
+		t.Fatalf("decode plain tuple boundary: %v", err)
+	}
+	escaped := bytes.Repeat([]byte{'a'}, MaxTupleBytes-6)
+	escaped[MaxTupleBytes/2] = 0
+	encoded, err = EncodeTuple(Bytes(escaped))
+	if err != nil || len(encoded) != MaxTupleBytes {
+		t.Fatalf("escaped tuple boundary: len=%d err=%v", len(encoded), err)
+	}
+	if _, err := DecodeTuple(encoded); err != nil {
+		t.Fatalf("decode escaped tuple boundary: %v", err)
+	}
+	if _, err := DecodeTuple(append(encoded, 0)); err == nil {
+		t.Fatal("DecodeTuple accepted an over-limit tuple")
+	}
+}
+
 func TestConstructorsCopyByteSlices(t *testing.T) {
 	input := []byte{1, 2}
 	component := Bytes(input)

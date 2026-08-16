@@ -4,7 +4,10 @@
 
 ## Decision
 
-Persistent tuple keys use `pkg/codec`, not protobuf. A tuple is version byte
+Persistent tuple keys use `pkg/codec`, not protobuf. Format v1 accepts at most
+`MaxComponents = 128` components and `MaxTupleBytes = 1 MiB`; EncodeTuple and
+DecodeTuple enforce both bounds, including zero-escape expansion. A tuple is
+version byte
 `01`, followed by typed components, followed by byte `00`. Bytes and UTF-8
 strings use a zero-escape (`00 ff`) and `00 00` terminator. Fixed-width
 integers are big-endian; signed int64 flips the sign bit before encoding.
@@ -26,8 +29,9 @@ preserving arbitrarily large integer precision. Exact numeric token spellings
 are preserved in the canonical bytes; those bytes are not a semantic
 numeric-equality oracle. For example, `1`, `1.0`, and `1e0` remain distinct
 canonical spellings. `encoding/json` HTML escaping remains deliberate in
-canonical v1: `<`, `>`, and `&` are emitted as `\u003c`, `\u003e`, and
-`\u0026`; this is deterministic escaping, not an RFC 8785/JCS claim.
+canonical v1: `<`, `>`, `&`, U+2028, and U+2029 are emitted using the standard
+`\u003c`, `\u003e`, `\u0026`, `\u2028`, and `\u2029` escapes; this is deterministic
+escaping, not an RFC 8785/JCS claim.
 `Document.Value` returns a deep copy, so callers cannot mutate the persisted
 representation through the decoded map or slices. The zero `Document` is the
 explicit canonical JSON null value: `Bytes` returns `null` and `Value` returns

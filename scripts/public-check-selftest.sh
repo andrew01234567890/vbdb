@@ -25,6 +25,9 @@ empty_repo=$(mktemp -d "$temp_root/empty.XXXXXX")
 history_repo=$(mktemp -d "$temp_root/history.XXXXXX")
 staged_repo=$(mktemp -d "$temp_root/staged.XXXXXX")
 gitlink_repo=$(mktemp -d "$temp_root/gitlink.XXXXXX")
+graft_repo=$(mktemp -d "$temp_root/graft.XXXXXX")
+redirect_repo=$(mktemp -d "$temp_root/redirect.XXXXXX")
+wrapper_bin=$(mktemp -d "$temp_root/bin.XXXXXX")
 cleanup() {
 	rm -rf -- "$temp_root"
 }
@@ -53,6 +56,14 @@ pgp_header=$(printf '%s%s%s%s' '-----BEGIN ' 'PGP ' 'PRIVATE KEY ' 'BLOCK-----')
 encrypted_header=$(printf '%s%s%s' '-----BEGIN ' 'ENCRYPTED ' 'PRIVATE KEY-----')
 pkcs8_header=$(printf '%s%s%s' '-----BEGIN ' 'PRIVATE KEY' '-----')
 ssh2_header=$(printf '%s%s%s%s' '---- BEGIN ' 'SSH2 ENCRYPTED ' 'PRIVATE KEY ' '----')
+lower_assignment_key=$(printf '%s%s' 'secret' '_key')
+lower_assignment_value=$(printf '%s' 'abcdefghijklmnopqrstuvwxyz')
+punct_assignment_value=$(printf '%s%s' '!' 'abcdefghijklmnopqrstuvwxyz')
+unsafe_newline=$(printf 'unsafe\npath.txt')
+unsafe_tab=$(printf 'unsafe\tpath.txt')
+unsafe_escape=$(printf 'unsafe\033path.txt')
+unsafe_bidi=$(printf 'unsafe\342\200\256path.txt')
+unsafe_unicode=$(printf 'unsafe\303\251path.txt')
 bash_version_helper=$(sed -n '/^require_bash4()/,/^}/p' "$root/scripts/public-check.sh")
 if [ -z "$bash_version_helper" ] || bash -c "$bash_version_helper; require_bash4 3" >/dev/null 2>&1 || ! bash -c "$bash_version_helper; require_bash4 4"; then
 	printf '%s\n' 'public-check-selftest: Bash-version guard regression' >&2
@@ -69,6 +80,8 @@ printf '%s\n' "$pgp_header" > "$fixture/forms/pgp.txt"
 printf '%s\n' "$encrypted_header" > "$fixture/forms/encrypted.txt"
 printf '%s\n' "$pkcs8_header" > "$fixture/forms/pkcs8.txt"
 printf '%s\n' "$ssh2_header" > "$fixture/forms/ssh2.txt"
+printf '%s=%s\n' "$lower_assignment_key" "$lower_assignment_value" > "$fixture/forms/lowercase-assignment.txt"
+printf '%s=%s\n' "$lower_assignment_key" "$punct_assignment_value" > "$fixture/forms/punctuation-assignment.txt"
 printf '%s\n' "$ghp_token" > "$fixture/forms/ghp.txt"
 printf '%s\n' "$gho_token" > "$fixture/forms/gho.txt"
 printf '%s\n' "$ghu_token" > "$fixture/forms/ghu.txt"
@@ -100,7 +113,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for form in pgp encrypted pkcs8 ssh2 ghp gho ghu ghs ghr; do
+for form in pgp encrypted pkcs8 ssh2 lowercase-assignment punctuation-assignment ghp gho ghu ghs ghr; do
 	case "$output" in
 		*"forms/$form.txt"*) ;;
 		*)
@@ -130,7 +143,7 @@ case "$output" in
 		exit 1
 		;;
 esac
-for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$pkcs8_header" "$ssh2_header" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
+for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "$pkcs8_header" "$ssh2_header" "$lower_assignment_key=$lower_assignment_value" "$lower_assignment_key=$punct_assignment_value" "$ghp_token" "$gho_token" "$ghu_token" "$ghs_token" "$ghr_token"; do
 	case "$output" in
 		*"$secret"*)
 			printf '%s\n' 'public-check-selftest: detector leaked fixture contents' >&2
@@ -140,8 +153,11 @@ for secret in "$marker_prefix$marker_suffix" "$pgp_header" "$encrypted_header" "
 done
 
 printf '%s\n' 'not-a-git-index' > "$broken_index"
+real_git=$(command -v git)
+printf '%s\n' '#!/usr/bin/env bash' 'for arg in "$@"; do' '  if [ "$arg" = ls-files ]; then exit 1; fi' 'done' 'exec "$PUBLIC_CHECK_REAL_GIT" "$@"' > "$wrapper_bin/git"
+chmod 0755 "$wrapper_bin/git"
 set +e
-output=$(GIT_INDEX_FILE="$broken_index" "$scanner_repo/scripts/public-check.sh" 2>&1)
+output=$(PATH="$wrapper_bin:$PATH" PUBLIC_CHECK_REAL_GIT="$real_git" GIT_INDEX_FILE="$broken_index" "$scanner_repo/scripts/public-check.sh" 2>&1)
 check_status=$?
 set -e
 if [ "$check_status" -eq 0 ]; then
@@ -167,10 +183,11 @@ cp "$root/scripts/public-check.sh" "$history_repo/scripts/public-check.sh"
 printf '%s%s\n%s\n' "$marker_prefix" "$marker_suffix" "$pkcs8_header" > "$history_repo/history.txt"
 printf '%s\n' 'safe historical path fixture' > "$history_repo/$aws_path"
 printf '%s\n' 'safe historical path fixture' > "$history_repo/$github_path"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$history_repo/$unsafe_newline"
 mkdir -p "$history_repo/secrets"
 printf '%s\n' 'safe historical filename fixture' > "$history_repo/secrets/old.txt"
 git -C "$history_repo" init -q
-git -C "$history_repo" add scripts/public-check.sh history.txt secrets/old.txt -- "$aws_path" "$github_path"
+git -C "$history_repo" add scripts/public-check.sh history.txt secrets/old.txt -- "$aws_path" "$github_path" "$unsafe_newline"
 git -C "$history_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm initial
 printf '%s\n' 'safe worktree and index' > "$history_repo/history.txt"
 git -C "$history_repo" add history.txt
@@ -237,6 +254,14 @@ for sensitive_path in "$aws_path" "$github_path" 'secrets/old.txt'; do
 			;;
 	esac
 done
+for unsafe_path in "$unsafe_newline"; do
+	case "$output" in
+		*"$unsafe_path"*)
+			printf '%s\n' 'public-check-selftest: unsafe historical path leaked' >&2
+			exit 1
+			;;
+	esac
+done
 case "$output" in
 	*"REF:$tag_object"*) ;;
 	*)
@@ -258,6 +283,69 @@ for secret in "$marker_prefix$marker_suffix" "$pkcs8_header" "$gho_token" "$ghs_
 			;;
 	esac
 done
+
+mkdir -p "$graft_repo/scripts"
+cp "$root/scripts/public-check.sh" "$graft_repo/scripts/public-check.sh"
+printf '%s\n' 'safe graft fixture' > "$graft_repo/data.txt"
+git -C "$graft_repo" init -q
+git -C "$graft_repo" add scripts/public-check.sh data.txt
+git -C "$graft_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm initial
+printf '%s\n' "$marker_prefix$marker_suffix" > "$graft_repo/ancestor.txt"
+git -C "$graft_repo" add ancestor.txt
+git -C "$graft_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm ancestor-secret
+rm -f -- "$graft_repo/ancestor.txt"
+git -C "$graft_repo" add -u ancestor.txt
+git -C "$graft_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm clean-child
+graft_child=$(git -C "$graft_repo" rev-parse HEAD)
+graft_common_dir=$(git -C "$graft_repo" rev-parse --path-format=absolute --git-common-dir)
+mkdir -p "$graft_common_dir/info"
+printf '%s\n' "$graft_child" > "$graft_common_dir/info/grafts"
+awk '
+index($0, "if ! check_grafts") == 1 { skip=1; next }
+skip && $0 == "fi" { skip=0; next }
+!skip { print }
+' "$graft_repo/scripts/public-check.sh" > "$graft_repo/scripts/public-check-unprotected.sh"
+chmod 0755 "$graft_repo/scripts/public-check-unprotected.sh"
+set +e
+output=$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "$graft_repo/scripts/public-check-unprotected.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -ne 0 ]; then
+	printf 'public-check-selftest: unprotected graft scanner status = %s, want 0\n' "$check_status" >&2
+	exit 1
+fi
+case "$output" in
+	*"$marker_prefix$marker_suffix"*)
+		printf '%s\n' 'public-check-selftest: unprotected graft scanner unexpectedly found hidden ancestor' >&2
+		exit 1
+		;;
+	*passed*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: unprotected graft scanner did not pass cleanly' >&2
+		exit 1
+		;;
+esac
+set +e
+output=$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "$graft_repo/scripts/public-check.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -ne 2 ]; then
+	printf 'public-check-selftest: protected graft scanner status = %s, want 2\n' "$check_status" >&2
+	exit 1
+fi
+case "$output" in
+	*'legacy Git grafts'*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: protected graft scanner did not reject grafts' >&2
+		exit 1
+		;;
+esac
+case "$output" in
+	*"$marker_prefix$marker_suffix"*)
+		printf '%s\n' 'public-check-selftest: protected graft scanner leaked ancestor content' >&2
+		exit 1
+		;;
+esac
 
 mkdir -p "$gitlink_repo/scripts"
 cp "$root/scripts/public-check.sh" "$gitlink_repo/scripts/public-check.sh"
@@ -390,15 +478,56 @@ case "$output" in
 		;;
 esac
 
+mkdir -p "$redirect_repo/scripts"
+cp "$root/scripts/public-check.sh" "$redirect_repo/scripts/public-check.sh"
+printf '%s\n' 'safe redirect fixture' > "$redirect_repo/clean.txt"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$redirect_repo/redirect-secret.txt"
+git -C "$redirect_repo" init -q
+git -C "$redirect_repo" add scripts/public-check.sh clean.txt redirect-secret.txt
+git -C "$redirect_repo" -c user.name=public-check -c user.email=public-check@example.invalid commit -qm redirect-secret
+redirect_git_dir=$(git -C "$redirect_repo" rev-parse --path-format=absolute --git-dir)
+set +e
+output=$(GIT_DIR="$redirect_git_dir" \
+	GIT_WORK_TREE="$redirect_repo" \
+	GIT_COMMON_DIR="$redirect_git_dir" \
+	GIT_INDEX_FILE="$redirect_git_dir/index" \
+	GIT_OBJECT_DIRECTORY="$redirect_git_dir/objects" \
+	GIT_ALTERNATE_OBJECT_DIRECTORIES="$redirect_git_dir/objects" \
+	GIT_SHALLOW_FILE="$redirect_git_dir/shallow" \
+	GIT_REPLACE_REF_BASE=refs/replace \
+	GIT_GRAFT_FILE="$redirect_git_dir/info/grafts" \
+	GIT_NAMESPACE=redirect \
+	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0="$redirect_repo" \
+	GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+	"$root/scripts/public-check.sh" 2>&1)
+check_status=$?
+set -e
+if [ "$check_status" -ne 0 ]; then
+	printf 'public-check-selftest: redirected-environment scanner status = %s, want 0\n' "$check_status" >&2
+	exit 1
+fi
+case "$output" in
+	*"$marker_prefix$marker_suffix"*)
+		printf '%s\n' 'public-check-selftest: repository-selection environment redirected the scan' >&2
+		exit 1
+		;;
+	*passed*) ;;
+	*)
+		printf '%s\n' 'public-check-selftest: redirected-environment scanner did not pass cleanly' >&2
+		exit 1
+		;;
+esac
+
 mkdir -p "$staged_repo/scripts"
 cp "$root/scripts/public-check.sh" "$staged_repo/scripts/public-check.sh"
 printf '%s%s\n%s\n' "$marker_prefix" "$marker_suffix" "$pkcs8_header" > "$staged_repo/staged.txt"
 printf '%s\n' "$marker_prefix$marker_suffix" > "$staged_repo/$index_aws_path"
 printf '%s\n' "$ghu_token" > "$staged_repo/$index_github_path"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$staged_repo/$unsafe_tab"
 printf '%s\n' 'safe staged private filename fixture' > "$staged_repo/id_rsa"
 git -C "$staged_repo" init -q
-git -C "$staged_repo" add scripts/public-check.sh staged.txt id_rsa -- "$index_aws_path" "$index_github_path"
-rm -f -- "$staged_repo/staged.txt" "$staged_repo/id_rsa" "$staged_repo/$index_aws_path" "$staged_repo/$index_github_path"
+git -C "$staged_repo" add scripts/public-check.sh staged.txt id_rsa -- "$index_aws_path" "$index_github_path" "$unsafe_tab"
+rm -f -- "$staged_repo/staged.txt" "$staged_repo/id_rsa" "$staged_repo/$index_aws_path" "$staged_repo/$index_github_path" "$staged_repo/$unsafe_tab"
 set +e
 output=$("$staged_repo/scripts/public-check.sh" 2>&1)
 check_status=$?
@@ -408,7 +537,7 @@ if [ "$check_status" -eq 0 ]; then
 	exit 1
 fi
 case "$output" in
-	*'INDEX:staged.txt'*) ;;
+	*'INDEX:'*'staged.txt'*) ;;
 	*)
 		printf '%s\n' 'public-check-selftest: staged blob was not scanned' >&2
 		exit 1
@@ -429,6 +558,12 @@ for sensitive_path in "$index_aws_path" "$index_github_path" id_rsa; do
 			;;
 	esac
 done
+case "$output" in
+	*"$unsafe_tab"*)
+		printf '%s\n' 'public-check-selftest: unsafe index path leaked' >&2
+		exit 1
+		;;
+esac
 for secret in "$marker_prefix$marker_suffix" "$pkcs8_header"; do
 	case "$output" in
 		*"$secret"*)
@@ -458,8 +593,13 @@ printf '%s\n' 'safe fixture' > "$isolated/Secrets"
 printf '%s\n' 'safe fixture' > "$isolated/PRIVATE/Thing"
 printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$worktree_aws_path"
 printf '%s\n' "$ghs_token" > "$isolated/$worktree_github_path"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_newline"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_tab"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_escape"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_bidi"
+printf '%s\n' "$marker_prefix$marker_suffix" > "$isolated/$unsafe_unicode"
 git -C "$isolated" init -q
-git -C "$isolated" add scripts/public-check.sh deploy/.kube/config id_rsa secret.go secrets.go credentials.go .env.sample .env.template id_ecdsa id_dsa encrypted.p8 Deploy/.KUBE/Config ID_RSA Secrets PRIVATE/Thing
+git -C "$isolated" add scripts/public-check.sh deploy/.kube/config id_rsa secret.go secrets.go credentials.go .env.sample .env.template id_ecdsa id_dsa encrypted.p8 Deploy/.KUBE/Config ID_RSA Secrets PRIVATE/Thing -- "$unsafe_newline" "$unsafe_tab" "$unsafe_escape" "$unsafe_bidi"
 printf '\n# %s%s\n' "$marker_prefix" "$marker_suffix" >> "$isolated/scripts/public-check.sh"
 set +e
 output=$("$isolated/scripts/public-check.sh" 2>&1)
@@ -477,19 +617,29 @@ case "$output" in
 		;;
 esac
 case "$output" in
-	*'PATH:WORKTREE:'*'high-risk private artifact filename'*) ;;
+	*'WORKTREE:'*'high-risk private artifact filename'*) ;;
 	*)
 		printf '%s\n' 'public-check-selftest: nested kube path was not rejected' >&2
 		exit 1
 		;;
 esac
 case "$output" in
-	*'PATH:WORKTREE:'*) ;;
+	*'WORKTREE:'*) ;;
 	*)
 		printf '%s\n' 'public-check-selftest: credential-shaped worktree path was not rejected' >&2
 		exit 1
 		;;
 esac
+high_risk_count=$(LC_ALL=C grep -F -c 'high-risk private artifact filename' <<<"$output" || true)
+if [ "$high_risk_count" -lt 9 ]; then
+	printf '%s\n' 'public-check-selftest: case-folded/nested high-risk paths were not all detected' >&2
+	exit 1
+fi
+digested_high_risk_count=$(LC_ALL=C grep -E -c 'WORKTREE:[0-9a-f]{64}: high-risk private artifact filename' <<<"$output" || true)
+if [ "$digested_high_risk_count" -lt 9 ]; then
+	printf '%s\n' 'public-check-selftest: high-risk path labels were not uniformly digested' >&2
+	exit 1
+fi
 for path in 'deploy/.kube/config' 'id_rsa' 'id_ecdsa' 'id_dsa' 'encrypted.p8' 'Deploy/.KUBE/Config' 'ID_RSA' 'Secrets' 'PRIVATE/Thing'; do
 	case "$output" in
 		*"$path"*)
@@ -503,6 +653,14 @@ for path in "$worktree_aws_path" "$worktree_github_path" secret.go secrets.go cr
 	case "$output" in
 		*"$path"*)
 			printf 'public-check-selftest: path %s was leaked or falsely rejected\n' "$path" >&2
+			exit 1
+			;;
+	esac
+done
+for unsafe_path in "$unsafe_newline" "$unsafe_tab" "$unsafe_escape" "$unsafe_bidi" "$unsafe_unicode"; do
+	case "$output" in
+		*"$unsafe_path"*)
+			printf '%s\n' 'public-check-selftest: unsafe worktree path leaked' >&2
 			exit 1
 			;;
 	esac
@@ -539,4 +697,21 @@ case "$output" in
 		exit 1
 		;;
 esac
+
+for invalid_tmp in relative-tmp "$root"; do
+	set +e
+	output=$(TMPDIR="$invalid_tmp" "$root/scripts/public-check.sh" 2>&1)
+	check_status=$?
+	set -e
+	if [ "$check_status" -ne 2 ]; then
+		printf '%s\n' 'public-check-selftest: unsafe scanner temporary directory was accepted' >&2
+		exit 1
+	fi
+	case "$output" in
+		*passed*)
+			printf '%s\n' 'public-check-selftest: unsafe scanner temporary directory reported success' >&2
+			exit 1
+			;;
+	esac
+done
 printf '%s\n' 'public-check-selftest: passed'

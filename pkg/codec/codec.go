@@ -13,6 +13,14 @@ import (
 
 const formatVersion byte = 1
 
+// Resource limits are part of the persisted format contract. They bound
+// recursive/index work and are enforced symmetrically by EncodeTuple and
+// DecodeTuple.
+const (
+	MaxComponents = 128
+	MaxTupleBytes = 1 << 20
+)
+
 const int64SignMask uint64 = 1 << 63
 
 // Kind identifies a tuple component's canonical representation.
@@ -141,6 +149,9 @@ func (k Kind) String() string {
 // one kind, and tuples with equal component prefixes, sort in value order with
 // bytes.Compare. Kind tags intentionally define ordering between unlike kinds.
 func EncodeTuple(components ...Component) ([]byte, error) {
+	if len(components) > MaxComponents {
+		return nil, fmt.Errorf("codec: tuple has more than %d components", MaxComponents)
+	}
 	encoded := []byte{formatVersion}
 	for _, component := range components {
 		if err := validate(component); err != nil {
@@ -153,14 +164,21 @@ func EncodeTuple(components ...Component) ([]byte, error) {
 		default:
 			encoded = append(encoded, component.data...)
 		}
+		if len(encoded) > MaxTupleBytes {
+			return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+		}
 	}
-	return append(encoded, 0), nil
+	encoded = append(encoded, 0)
+	if len(encoded) > MaxTupleBytes {
+		return nil, fmt.Errorf("codec: tuple exceeds %d bytes", MaxTupleBytes)
+	}
+	return encoded, nil
 }
 
 // DecodeTuple decodes one complete tuple and rejects unknown kinds, malformed
 // escapes, truncated fixed-width values, and trailing bytes.
 func DecodeTuple(encoded []byte) ([]Component, error) {
-	if len(encoded) < 2 || encoded[0] != formatVersion {
+	if len(encoded) < 2 || len(encoded) > MaxTupleBytes || encoded[0] != formatVersion {
 		return nil, errors.New("codec: invalid tuple version or length")
 	}
 	var components []Component
@@ -173,6 +191,9 @@ func DecodeTuple(encoded []byte) ([]Component, error) {
 		}
 		kind := Kind(encoded[offset])
 		offset++
+		if len(components) >= MaxComponents {
+			return nil, fmt.Errorf("codec: tuple has more than %d components", MaxComponents)
+		}
 		switch kind {
 		case BytesKind, StringKind:
 			data, next, err := readEscaped(encoded, offset)

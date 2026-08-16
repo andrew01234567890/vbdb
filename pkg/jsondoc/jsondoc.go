@@ -45,9 +45,9 @@ func Parse(input []byte) (Document, error) {
 	if err != nil {
 		return Document{}, fmt.Errorf("jsondoc: %w", err)
 	}
-	if token, err := decoder.Token(); err != io.EOF {
+	if _, err := decoder.Token(); err != io.EOF {
 		if err == nil {
-			return Document{}, fmt.Errorf("jsondoc: trailing JSON value %v", token)
+			return Document{}, errors.New("jsondoc: multiple JSON values")
 		}
 		return Document{}, fmt.Errorf("jsondoc: trailing data: %w", err)
 	}

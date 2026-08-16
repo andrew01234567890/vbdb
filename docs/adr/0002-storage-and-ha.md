@@ -10,6 +10,15 @@ Production code is native Go. Pebble is the local durable storage engine and
 voting replicas across three failure zones. Writes require a persisted quorum;
 VBDB fails closed after quorum loss and never auto-promotes a minority.
 
+The clock contract is explicit: `Clock.Now` readings used for elapsed-time
+logic are monotonic within a process, while persisted HLC/deadline values are
+explicit wall/HLC scalars with Go's process-local monotonic component stripped
+before serialization. Equality and ordering of persisted values use their
+encoded scalar fields, never hidden Go monotonic metadata. Manual clocks obey
+the same nondecreasing/equality contract deterministically; Real clocks retain
+the platform wall-clock failure behavior and require the replicated time
+authority for deadline decisions.
+
 Default GET reads are linearizable when offloaded. After request invocation,
 the gateway obtains a shard-leader `ReadIndex` (or an equivalent valid
 leader-lease freshness fence) for the range. The fence binds the range
@@ -35,6 +44,19 @@ invariant; otherwise the implementation must use `ReadIndex`. Additional
 non-voting read replicas may offload reads and background work but never count
 toward durability.
 
+The cache layers are bounded gateway row caches, replica decoded/index caches,
+and Pebble block caches. Every strong cache hit carries a matching range
+generation plus applied-index or HLC freshness fence; CDC invalidation is only
+an optimization and never the correctness proof. Transaction-private staged
+data never enters a shared cache tier. QUERY responses remain `no-store`.
+
+Global secondary indexes are independently sharded, replicated ranges and
+synchronous participants in row writes/2PC. Every write validates and reserves
+global uniqueness there; index generations move through fenced `BACKFILL`,
+`CATCHUP`, and `READY` states, and QUERY may use only a `READY` generation.
+There are no foreign keys in this contract. These indexes are later-milestone
+mechanisms, not implemented in Milestone 1.
+
 Primary keys map to stable 128-bit hash tokens for shard/range routing only.
 Within a range, the primary key remains the ordered canonical tuple; codec
 ordering and cursor logical bounds therefore remain meaningful and are not
@@ -57,6 +79,16 @@ shard, transaction decision, catalog record, and CDC position is durable. PITR
 restores into a new isolated cluster and replays only committed logical
 transactions. The journal cannot be deleted before the maximum of CDC, PITR,
 and active-backup retention dependencies.
+
+Base and incremental backups use immutable checksummed manifests and objects.
+Each backup takes one global barrier; an incremental names its parent and
+captures changed shard objects plus the required log interval. Restore runs in
+an isolated cluster and replays committed transactions only. CDC, PITR, and
+active-backup retention dependencies jointly constrain log deletion. The Go
+operator later owns CRDs and reconciliation for placement, backups/restores,
+resharding, and autoscaling, but it never guesses data-plane authority; status
+must reflect fenced catalog/Raft evidence. None of these mechanisms is
+implemented in Milestone 1.
 
 Transaction deadlines use a replicated/quorum-derived monotonic HLC authority,
 not an individual node's wall clock. A deadline makes a transaction eligible

@@ -39,3 +39,4 @@ private/
 .aws/
 .ssh/
 .kube/
+**/.kube/

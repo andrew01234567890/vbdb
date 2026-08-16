@@ -2,6 +2,16 @@
 # Check every byte source that a Git publication can carry. This intentionally
 # prints only paths and finding categories, never matched text.
 set -u
+# Repository-selection and object-override environment variables are caller
+# controlled. Never let them redirect a publication scan away from this
+# worktree; ordinary config/identity variables remain untouched.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_SHALLOW_FILE \
+	GIT_REPLACE_REF_BASE GIT_GRAFT_FILE GIT_NAMESPACE GIT_CONFIG \
+	GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
 export GIT_NO_REPLACE_OBJECTS=1
 
 require_bash4() {
@@ -35,7 +45,62 @@ case "$shallow" in
 		printf '%s\n' 'public-check: invalid shallow-repository state' >&2
 		exit 2
 		;;
+	esac
+
+# Git's legacy grafts file can rewrite parentage locally and hide reachable
+# history from rev-list. Resolve the shared object directory before any
+# history walk and fail closed for every graft path type, including a broken
+# symlink. Replace refs are disabled separately above.
+common_dir=
+if ! common_dir=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+	printf '%s\n' 'public-check: unable to resolve Git common directory' >&2
+	exit 2
+fi
+case "$common_dir" in
+	/*) ;;
+	*)
+		printf '%s\n' 'public-check: Git common directory was not absolute' >&2
+		exit 2
+		;;
 esac
+if ! common_dir=$(CDPATH= cd -- "$common_dir" && pwd -P); then
+	printf '%s\n' 'public-check: unable to validate Git common directory' >&2
+	exit 2
+fi
+check_grafts() {
+	local grafts_path=$1
+	if [ -e "$grafts_path/info/grafts" ] || [ -L "$grafts_path/info/grafts" ]; then
+		return 1
+	fi
+	return 0
+}
+if ! check_grafts "$common_dir"; then
+	printf '%s\n' 'public-check: legacy Git grafts are not publishable' >&2
+	exit 2
+fi
+
+scan_tmp_root=${TMPDIR:-/tmp}
+case "$scan_tmp_root" in
+	/*) ;;
+	*)
+		printf '%s\n' 'public-check: scan temporary directory must be absolute' >&2
+		exit 2
+		;;
+esac
+if ! scan_tmp_root=$(CDPATH= cd -- "$scan_tmp_root" 2>/dev/null && pwd -P); then
+	printf '%s\n' 'public-check: unable to validate scan temporary directory' >&2
+	exit 2
+fi
+case "$scan_tmp_root" in
+	"$root"|"$root"/*|"$common_dir"|"$common_dir"/*)
+		printf '%s\n' 'public-check: scan temporary directory is inside the repository' >&2
+		exit 2
+		;;
+esac
+if [ ! -w "$scan_tmp_root" ] || [ ! -x "$scan_tmp_root" ]; then
+	printf '%s\n' 'public-check: scan temporary directory is not writable' >&2
+	exit 2
+fi
 
 history_manifest=
 tree_manifest=
@@ -44,6 +109,8 @@ index_manifest=
 worktree_manifest=
 content_file=
 object_file=
+path_digest=
+path_display_safe=0
 failures=0
 source_count=0
 declare -A scanned_blobs=()
@@ -70,7 +137,7 @@ report() {
 
 make_temp() {
 	local path
-	path=$(mktemp "${TMPDIR:-/tmp}/vbdb-public-check.XXXXXX") || return 1
+	path=$(mktemp "$scan_tmp_root/vbdb-public-check.XXXXXX" 2>/dev/null) || return 1
 	printf '%s\n' "$path"
 }
 
@@ -86,13 +153,29 @@ fi
 # documentation must not be treated as credentials.
 key_begin='-----BEGIN '
 key_end='-----'
-private_word='PRIVATE KEY'
-private_key_pattern="${key_begin}(RSA|EC|OPENSSH|DSA) ${private_word}${key_end}"
-pgp_key_pattern="${key_begin}PGP ${private_word} BLOCK${key_end}"
-encrypted_key_pattern="${key_begin}ENCRYPTED ${private_word}${key_end}"
-pkcs8_key_pattern="${key_begin}${private_word}${key_end}"
+key_phrase='PRIVATE KEY'
+pem_pattern="${key_begin}(RSA|EC|OPENSSH|DSA) ${key_phrase}${key_end}"
+pgp_key_pattern="${key_begin}PGP ${key_phrase} BLOCK${key_end}"
+encrypted_key_pattern="${key_begin}ENCRYPTED ${key_phrase}${key_end}"
+pkcs8_key_pattern="${key_begin}${key_phrase}${key_end}"
 ssh2_encrypted_key_pattern=$(printf '%s%s%s%s' '---- BEGIN ' 'SSH2 ENCRYPTED ' 'PRIVATE KEY ' '----')
-credential_pattern="${private_key_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|${pkcs8_key_pattern}|${ssh2_encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|[A-Z][A-Z0-9_]*(SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]{8,}"
+assignment_words=$(printf '%s%s%s%s' 'SECRET' '|PASSWORD|' 'PRIVATE' '_KEY')
+assignment_prefix='(^|[^A-Z0-9_])[A-Z0-9_]*('
+assignment_suffix=')[A-Z0-9_]*[[:space:]]*'
+assignment_equals='='
+assignment_value='[[:space:]]*'
+assignment_value="${assignment_value}[\"']?"
+assignment_forbidden='[^[:space:]#'
+assignment_forbidden="${assignment_forbidden}\""
+assignment_forbidden="${assignment_forbidden}'"
+assignment_forbidden="${assignment_forbidden}("
+assignment_forbidden="${assignment_forbidden}\$"
+assignment_forbidden="${assignment_forbidden}\\["
+assignment_forbidden="${assignment_forbidden}]"
+assignment_value="${assignment_value}${assignment_forbidden}"
+assignment_value="${assignment_value}[^[:space:]#]{7,}"
+assignment_pattern="${assignment_prefix}${assignment_words}${assignment_suffix}${assignment_equals}${assignment_value}"
+credential_pattern="${pem_pattern}|${pgp_key_pattern}|${encrypted_key_pattern}|${pkcs8_key_pattern}|${ssh2_encrypted_key_pattern}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|${assignment_pattern}"
 
 # These are names, not content matches. Examples and source files remain
 # publishable, while common local credential and private-material paths do not.
@@ -100,8 +183,8 @@ is_high_risk_name() {
 	local path=$1
 	local base=${path##*/}
 	local lower_path lower_base
-	lower_path=$(printf '%s' "$path" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-	lower_base=$(printf '%s' "$base" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+	lower_path=${path,,}
+	lower_base=${base,,}
 	case "$lower_path" in
 		secrets/*|private/*|credentials/*|.codex/*|.claude/*|.aws/*|.ssh/*|.kube/*|*/secrets/*|*/private/*|*/credentials/*|*/.codex/*|*/.claude/*|*/.aws/*|*/.ssh/*|*/.kube/*)
 			return 0
@@ -121,12 +204,27 @@ is_high_risk_name() {
 	return 1
 }
 
+scan_signature() {
+	local file=$1 grep_status
+	LC_ALL=C grep -E -a -q -- "$credential_pattern" "$file" 2>/dev/null
+	grep_status=$?
+	case "$grep_status" in
+		0) return 0 ;;
+		1) ;;
+		*) return 2 ;;
+	esac
+	# Only the assignment form is case-insensitive; headers, token prefixes,
+	# and other signatures retain their deliberately narrow exact matching.
+	LC_ALL=C grep -E -a -i -q -- "$assignment_pattern" "$file" 2>/dev/null
+	return $?
+}
+
 scan_content() {
 	local label=$1 file=$2 grep_status
 	source_count=$((source_count + 1))
 	# -a is deliberate: binary files are scanned as bytes, while -q keeps
 	# matched content out of output.
-	LC_ALL=C grep -E -a -q -- "$credential_pattern" "$file" 2>/dev/null
+	scan_signature "$file"
 	grep_status=$?
 	case "$grep_status" in
 		0) report "$label" 'credential or private-key signature' ;;
@@ -155,21 +253,26 @@ scan_ref_name() {
 }
 
 scan_path_bytes() {
-	local source=$1 path=$2 grep_status digest
+	local source=$1 path=$2 grep_status
 	if ! printf '%s' "$path" >"$content_file"; then
 		report "$source" 'unable to materialize path bytes'
 		return 2
 	fi
-	LC_ALL=C grep -E -a -q -- "$credential_pattern" "$content_file" 2>/dev/null
+	if [[ "$path" =~ ^[A-Za-z0-9._/@+=,-]+$ ]]; then
+		path_display_safe=1
+	else
+		path_display_safe=0
+	fi
+	if ! path_digest=$(sha256sum "$content_file" 2>/dev/null); then
+		report "$source" 'unable to identify path'
+		return 2
+	fi
+	path_digest=${path_digest%%[[:space:]]*}
+	scan_signature "$content_file"
 	grep_status=$?
 	case "$grep_status" in
 		0)
-			if ! digest=$(sha256sum "$content_file" 2>/dev/null); then
-				report "$source" 'unable to identify credential-shaped path'
-				return 2
-			fi
-			digest=${digest%%[[:space:]]*}
-			report "$source:$digest" 'credential-shaped path'
+			report "$source:$path_digest" 'credential-shaped path'
 			return 0
 			;;
 		1) return 1 ;;
@@ -180,8 +283,17 @@ scan_path_bytes() {
 	esac
 }
 
+path_label() {
+	local source=$1 path=$2 sensitive=${3:-0}
+	if [ "$sensitive" -eq 0 ] && [ "$path_display_safe" -eq 1 ]; then
+		printf '%s:%s\n' "$source" "$path"
+	else
+		printf '%s:%s\n' "$source" "$path_digest"
+	fi
+}
+
 scan_tree() {
-	local label=$1 treeish=$2 record meta path object_type object_id path_match safe_label
+	local label=$1 treeish=$2 record meta path object_type object_id path_match path_sensitive safe_label
 	if ! git -C "$root" ls-tree -r -z --full-tree "$treeish" >"$tree_manifest" 2>/dev/null; then
 		printf '%s\n' 'public-check: unable to enumerate reachable tree' >&2
 		exit 2
@@ -200,26 +312,25 @@ scan_tree() {
 		else
 			case "$?" in
 				1) ;;
-				*) exit 2 ;;
+			*) exit 2 ;;
 			esac
 		fi
+		path_sensitive=$path_match
+		if is_high_risk_name "$path"; then
+			path_sensitive=1
+		fi
+		safe_label=$(path_label "$label" "$path" "$path_sensitive")
 		if [ "$object_type" != 'blob' ]; then
-			report "PATH:TREE:$label:$treeish" 'unsupported historical tree entry'
+			report "$(path_label "PATH:TREE:$label:$treeish" "$path" "$path_sensitive")" 'unsupported historical tree entry'
 			exit 2
 		fi
 		if [ -z "$object_id" ]; then
-			report "PATH:TREE:$label:$treeish" 'missing historical tree object'
+			report "$safe_label" 'missing historical tree object'
 			exit 2
 		fi
 		if is_high_risk_name "$path"; then
-			if [ "$path_match" -eq 0 ]; then
-				report "PATH:TREE:$label:$treeish" 'high-risk private artifact filename'
-			fi
+			report "$safe_label" 'high-risk private artifact filename'
 			continue
-		fi
-		safe_label="$label:$path"
-		if [ "$path_match" -eq 1 ]; then
-			safe_label="PATH:TREE:$label:$treeish"
 		fi
 		scan_blob "$safe_label" "$object_id"
 	done <"$tree_manifest"
@@ -333,7 +444,6 @@ while IFS= read -r -d '' record; do
 	meta=${record%%$'\t'*}
 	path=${record#*$'\t'}
 	read -r _ object_id stage <<<"$meta"
-	safe_label="INDEX:$path"
 	path_match=0
 	if scan_path_bytes "PATH:INDEX:$object_id" "$path"; then
 		path_match=1
@@ -344,18 +454,21 @@ while IFS= read -r -d '' record; do
 			*) exit 2 ;;
 		esac
 	fi
+	path_sensitive=$path_match
+	if is_high_risk_name "$path"; then
+		path_sensitive=1
+	fi
+	safe_label=$(path_label "INDEX:$object_id" "$path" "$path_sensitive")
 	if [ "$stage" != '0' ]; then
-		report "PATH:INDEX:$object_id" 'unresolved index stage'
+		report "$safe_label" 'unresolved index stage'
 		continue
 	fi
 	if [ -z "$object_id" ]; then
-		report 'PATH:INDEX' 'missing index object'
+		report "$safe_label" 'missing index object'
 		exit 2
 	fi
 	if is_high_risk_name "$path"; then
-		if [ "$path_match" -eq 0 ]; then
-			report "PATH:INDEX:$object_id" 'high-risk private artifact filename'
-		fi
+		report "$safe_label" 'high-risk private artifact filename'
 		continue
 	fi
 	scan_blob "$safe_label" "$object_id"
@@ -371,7 +484,6 @@ if ! git -C "$root" ls-files --cached --others --exclude-standard -z >"$worktree
 fi
 while IFS= read -r -d '' path; do
 	file="$root/$path"
-	safe_label="WORKTREE:$path"
 	path_match=0
 	if scan_path_bytes 'PATH:WORKTREE' "$path"; then
 		path_match=1
@@ -382,15 +494,13 @@ while IFS= read -r -d '' path; do
 			*) exit 2 ;;
 		esac
 	fi
+	path_sensitive=$path_match
 	if is_high_risk_name "$path"; then
-		if [ "$path_match" -eq 0 ]; then
-			if ! path_digest=$(sha256sum "$content_file" 2>/dev/null); then
-				report 'PATH:WORKTREE' 'unable to identify high-risk path'
-				exit 2
-			fi
-			path_digest=${path_digest%%[[:space:]]*}
-			report "PATH:WORKTREE:$path_digest" 'high-risk private artifact filename'
-		fi
+		path_sensitive=1
+	fi
+	safe_label=$(path_label WORKTREE "$path" "$path_sensitive")
+	if is_high_risk_name "$path"; then
+		report "$safe_label" 'high-risk private artifact filename'
 		continue
 	fi
 	if [ ! -e "$file" ] && [ ! -L "$file" ]; then
