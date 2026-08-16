@@ -27,6 +27,7 @@ type SplitHarness struct {
 	deltaBytes     int
 	operation      *splitOperation
 	operations     map[uuidv7.UUID]splitOperationRecord
+	cutover        bool
 }
 
 func NewSplitHarness(source RangeDescriptor, rows []storage.Row) (*SplitHarness, error) {
@@ -191,6 +192,30 @@ func (h *SplitHarness) Write(command Command) (Result, error) {
 	if stored, exists := h.operations[command.OperationID]; exists {
 		return cloneResult(stored.Result), nil
 	}
+	if h.cutover {
+		var target map[string]storage.Row
+		if h.operation.left.Contains([]byte(command.Key)) {
+			target = h.operation.leftRows
+		} else if h.operation.right.Contains([]byte(command.Key)) {
+			target = h.operation.rightRows
+		} else {
+			return Result{}, ErrRangeGap
+		}
+		if h.operation.left.Contains([]byte(command.Key)) || h.operation.right.Contains([]byte(command.Key)) {
+			result := evaluateTransferCommand(target, command, h.sourceSequence+1)
+			h.sourceSequence++
+			if result.Succeeded() {
+				target[splitRowID(result.Row.Table, result.Row.Key)] = cloneTransferRow(result.Row)
+			}
+			delta := splitDeltaFor(h.operation.source, h.sourceEpoch, h.sourceSequence, command, result)
+			digest, err := splitDeltaDigest(delta)
+			if err != nil {
+				return Result{}, ErrSplitChecksum
+			}
+			h.operations[command.OperationID] = splitOperationRecord{Sequence: delta.Sequence, Digest: digest, Result: cloneResult(result)}
+			return cloneResult(result), nil
+		}
+	}
 	if h.operation != nil && (len(h.deltas) >= maxSplitDeltas || h.deltaBytes+len(command.Value) > maxSplitDeltaBytesTotal) {
 		return Result{}, ErrBackpressure
 	}
@@ -224,8 +249,9 @@ func (h *SplitHarness) Write(command Command) (Result, error) {
 func (h *SplitHarness) WriteAtLeader(command Command, leaderID, term, ownerEpoch uint64) (Result, error) {
 	h.mu.Lock()
 	valid := leaderID == h.leader && term == h.leaderTerm && ownerEpoch == h.sourceEpoch
+	cutover := h.cutover
 	h.mu.Unlock()
-	if !valid {
+	if !valid || cutover {
 		return Result{}, ErrSplitGeneration
 	}
 	return h.Write(command)
@@ -335,7 +361,15 @@ func (h *SplitHarness) Snapshot() (SplitSnapshot, error) {
 func (h *SplitHarness) Read(table string, key []byte) (storage.Row, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	row, ok := h.sourceRows[splitRowID(table, string(key))]
+	rows := h.sourceRows
+	if h.cutover && h.operation != nil {
+		if h.operation.left.Contains(key) {
+			rows = h.operation.leftRows
+		} else if h.operation.right.Contains(key) {
+			rows = h.operation.rightRows
+		}
+	}
+	row, ok := rows[splitRowID(table, string(key))]
 	if !ok {
 		return storage.Row{}, storage.ErrNotFound
 	}
