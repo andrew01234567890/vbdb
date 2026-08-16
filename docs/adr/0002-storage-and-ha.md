@@ -35,9 +35,12 @@ invariant; otherwise the implementation must use `ReadIndex`. Additional
 non-voting read replicas may offload reads and background work but never count
 toward durability.
 
-Primary keys map to stable 128-bit hash tokens. Every range descriptor carries
-an ID, logical bounds, a monotonically increasing generation, placements, and
-serving state. Gateways watch the replicated metadata catalog. Requests carry
+Primary keys map to stable 128-bit hash tokens for shard/range routing only.
+Within a range, the primary key remains the ordered canonical tuple; codec
+ordering and cursor logical bounds therefore remain meaningful and are not
+replaced by hash order. Every range descriptor carries an ID, logical bounds,
+a monotonically increasing generation, placements, and serving state. Gateways
+watch the replicated metadata catalog. Requests carry
 the generation and retry stale `RANGE_MOVED` responses internally; clients
 never receive an HTTP redirect.
 
@@ -56,7 +59,9 @@ transactions. The journal cannot be deleted before the maximum of CDC, PITR,
 and active-backup retention dependencies.
 
 Transaction deadlines use a replicated/quorum-derived monotonic HLC authority,
-not an individual node's wall clock. The quorum time service returns a
+not an individual node's wall clock. A deadline makes a transaction eligible
+for an expiry timer or sweeper to attempt the replicated `EXPIRED` decision;
+it is not a local automatic rollback. The quorum time service returns a
 replicated uncertainty interval `[earliest, latest]` guaranteed to contain
 cluster time under the declared maximum skew bound. `COMMITTED` may be chosen
 only when `latest < deadline`; `EXPIRED` may be chosen only when

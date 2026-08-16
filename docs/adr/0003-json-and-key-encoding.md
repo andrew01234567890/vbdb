@@ -14,6 +14,8 @@ truncation, and trailing bytes.
 
 `pkg/jsondoc` parses with `json.Decoder.UseNumber`, rejects duplicate keys at
 any depth, invalid UTF-8, trailing values, and invalid/non-finite number forms.
+Unpaired UTF-16 surrogate escapes are rejected rather than normalized to
+U+FFFD; paired surrogate escapes remain valid and canonicalize deterministically.
 The explicit number regexp is intentional defense in depth: the current
 `encoding/json` decoder already prevalidates number grammar, but this package
 retains its own check at the token boundary.
@@ -23,8 +25,13 @@ object-key ordering and number tokens emitted without a float64 conversion,
 preserving arbitrarily large integer precision. Exact numeric token spellings
 are preserved in the canonical bytes; those bytes are not a semantic
 numeric-equality oracle. For example, `1`, `1.0`, and `1e0` remain distinct
-canonical spellings. `Document.Value` returns a deep copy, so callers cannot
-mutate the persisted representation through the decoded map or slices.
+canonical spellings. `encoding/json` HTML escaping remains deliberate in
+canonical v1: `<`, `>`, and `&` are emitted as `\u003c`, `\u003e`, and
+`\u0026`; this is deterministic escaping, not an RFC 8785/JCS claim.
+`Document.Value` returns a deep copy, so callers cannot mutate the persisted
+representation through the decoded map or slices. The zero `Document` is the
+explicit canonical JSON null value: `Bytes` returns `null` and `Value` returns
+`nil`.
 
 ## Consequences
 

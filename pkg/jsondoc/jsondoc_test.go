@@ -110,6 +110,34 @@ func TestPreservesNumericTokenSpellings(t *testing.T) {
 	}
 }
 
+func TestCanonicalEscapesHTMLDeterministically(t *testing.T) {
+	canonical, err := Canonicalize([]byte(`{"value":"<&>"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"value":"\u003c\u0026\u003e"}`
+	if string(canonical) != want {
+		t.Fatalf("canonical HTML escaping = %s, want %s", canonical, want)
+	}
+	again, err := Canonicalize(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != want {
+		t.Fatalf("canonical HTML escaping was not idempotent: %s", again)
+	}
+}
+
+func TestZeroDocumentIsJSONNull(t *testing.T) {
+	var document Document
+	if got := string(document.Bytes()); got != "null" {
+		t.Fatalf("zero Document.Bytes() = %q, want null", got)
+	}
+	if got := document.Value(); got != nil {
+		t.Fatalf("zero Document.Value() = %#v, want nil", got)
+	}
+}
+
 func TestCanonicalBytesAreIndependentCopies(t *testing.T) {
 	canonical, err := Canonicalize([]byte(`{"a":1}`))
 	if err != nil {

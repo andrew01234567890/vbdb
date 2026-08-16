@@ -32,3 +32,9 @@ jobs:
         run: make public-check-selftest
       - name: Diff check
         run: make diff-check
+      - name: Committed diff check
+        env:
+          VBDB_EVENT_NAME: ${{ github.event_name }}
+          VBDB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          VBDB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: make diff-check-ci

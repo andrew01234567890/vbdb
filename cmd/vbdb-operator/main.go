@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -25,6 +26,9 @@ func run(args []string) error {
 	fs.SetOutput(os.Stderr)
 	showVersion := fs.Bool("version", false, "print the vbdb-operator version")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() != 0 {

@@ -1,12 +1,12 @@
-.PHONY: all fmt fmt-check vet test race public-check public-check-selftest diff-check check clean
+.PHONY: all fmt fmt-check vet test race public-check public-check-selftest diff-check diff-check-ci diff-check-selftest check clean
 
 all: check
 
 fmt:
-	gofmt -w $$(find . -name '*.go' -type f -not -path './vendor/*')
+	./scripts/fmt.sh
 
 fmt-check:
-	test -z "$$(gofmt -l $$(find . -name '*.go' -type f -not -path './vendor/*'))"
+	./scripts/fmt-check.sh
 
 vet:
 	go vet ./...
@@ -26,7 +26,13 @@ public-check-selftest:
 diff-check:
 	git diff --check
 
-check: fmt-check vet test race public-check public-check-selftest diff-check
+diff-check-ci:
+	./scripts/diff-check-ci.sh
+
+diff-check-selftest:
+	./scripts/diff-check-selftest.sh
+
+check: fmt-check vet test race public-check public-check-selftest diff-check-selftest diff-check
 
 clean:
 	rm -rf bin coverage.out

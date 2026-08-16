@@ -21,6 +21,7 @@ make race
 make public-check
 make public-check-selftest
 make diff-check
+make diff-check-selftest
 make check
 ```
 
@@ -54,11 +55,18 @@ milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.m
 `make public-check` scans commits and trees reachable from all local refs (plus
 a detached `HEAD`), raw commit and annotated-tag objects, stage-zero index
 blobs, and current tracked/non-ignored intended files for high-risk artifact
-names and credential/private-key signatures. It reports filenames and
-categories only, never matching contents. `make public-check-selftest`
-exercises binary data, ref/history/index coverage, commit/tag metadata, path
-rules, replace-object immunity, shallow-history rejection, and fail-closed
-enumeration. It requires a complete non-shallow history and disables Git
-replace refs while scanning. Local environment files, keys, credentials, and
-secret/private directories are ignored by default; committed configuration
-must use a safe example file instead.
+names and credential/private-key signatures. It reports safe source identities
+and categories only; credential-shaped or high-risk filenames are redacted and
+matching contents are never printed. `make public-check-selftest` exercises
+binary data, ref/history/index/worktree path coverage, commit/tag metadata,
+replace-object immunity, shallow-history rejection, gitlink rejection, and
+fail-closed enumeration. All fixtures are created outside the repository in a
+validated temporary directory. It requires a complete non-shallow history and
+disables Git replace refs while scanning. Local environment files, keys,
+credentials, and secret/private directories are ignored by default; committed
+configuration must use a safe example file instead.
+
+`make diff-check` checks the local worktree. CI also runs
+`make diff-check-ci` over the exact event base/head range, checking every
+introduced commit (including an initial push); `make diff-check-selftest`
+covers introduced-then-removed whitespace and divergent pull-request bases.

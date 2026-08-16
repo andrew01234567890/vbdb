@@ -27,6 +27,9 @@ func run(args []string) error {
 	role := fs.String("role", "", "process role: gateway, metadata, or storage")
 	showVersion := fs.Bool("version", false, "print the vbdbd version")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() != 0 {

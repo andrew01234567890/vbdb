@@ -11,6 +11,12 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
+func TestRunHelp(t *testing.T) {
+	if err := run([]string{"--help"}); err != nil {
+		t.Fatalf("run --help returned %v", err)
+	}
+}
+
 func TestRunRequiresStrictRole(t *testing.T) {
 	for _, args := range [][]string{
 		{}, {"--role", "unknown"}, {"--role", "gateway", "extra"}, {"--version", "--role", "gateway"},

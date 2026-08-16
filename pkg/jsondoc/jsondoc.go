@@ -73,12 +73,18 @@ func Validate(input []byte) error {
 	return err
 }
 
-// Bytes returns a copy of the canonical representation.
-func (d Document) Bytes() []byte { return append([]byte(nil), d.canonical...) }
+// Bytes returns a copy of the canonical representation. The zero Document is
+// the explicit JSON null value, so it returns "null" rather than nil.
+func (d Document) Bytes() []byte {
+	if d.canonical == nil {
+		return []byte("null")
+	}
+	return append([]byte(nil), d.canonical...)
+}
 
 // Value returns a deep copy of the validated decoded value. Numbers are
-// json.Number values. Mutating the result cannot change the document or its
-// canonical representation.
+// json.Number values. The zero Document returns nil for JSON null. Mutating
+// the result cannot change the document or its canonical representation.
 func (d Document) Value() any { return cloneValue(d.value) }
 
 func parseValue(decoder *json.Decoder, depth int) (any, error) {

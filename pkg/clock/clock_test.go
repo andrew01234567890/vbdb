@@ -34,6 +34,67 @@ func TestRealClockNowTimerAndStop(t *testing.T) {
 	}
 }
 
+func TestRealAndManualUnreadExpiredStopParity(t *testing.T) {
+	manual := NewManual(time.Unix(100, 0))
+	manualTimer := manual.NewTimer(time.Second)
+	manual.Advance(2 * time.Second)
+
+	realTimer := Real{}.NewTimer(20 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	if !manualTimer.Stop() {
+		t.Fatal("manual Stop reported false for an unread expiration")
+	}
+	if !realTimer.Stop() {
+		t.Fatal("real Stop reported false for an unread expiration")
+	}
+}
+
+func TestRealAndManualUnreadExpiredResetParity(t *testing.T) {
+	manual := NewManual(time.Unix(100, 0))
+	manualTimer := manual.NewTimer(time.Second)
+	manual.Advance(2 * time.Second)
+
+	realTimer := Real{}.NewTimer(20 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	if !manualTimer.Reset(time.Second) {
+		t.Fatal("manual Reset reported false for an unread expiration")
+	}
+	if !realTimer.Reset(20 * time.Millisecond) {
+		t.Fatal("real Reset reported false for an unread expiration")
+	}
+	manual.Advance(time.Second)
+	select {
+	case <-manualTimer.C():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual reset timer did not fire")
+	}
+	select {
+	case <-realTimer.C():
+	case <-time.After(5 * time.Second):
+		t.Fatal("real reset timer did not fire")
+	}
+}
+
+func TestRealAndManualReceivedExpirationStopParity(t *testing.T) {
+	manual := NewManual(time.Unix(100, 0))
+	manualTimer := manual.NewTimer(time.Second)
+	manual.Advance(time.Second)
+	<-manualTimer.C()
+	if manualTimer.Stop() {
+		t.Fatal("manual Stop reported true after receiving expiration")
+	}
+
+	realTimer := Real{}.NewTimer(20 * time.Millisecond)
+	select {
+	case <-realTimer.C():
+	case <-time.After(5 * time.Second):
+		t.Fatal("real timer did not expire")
+	}
+	if realTimer.Stop() {
+		t.Fatal("real Stop reported true after receiving expiration")
+	}
+}
+
 func TestManualTimerFiresAtDeadline(t *testing.T) {
 	start := time.Unix(100, 0)
 	c := NewManual(start)
