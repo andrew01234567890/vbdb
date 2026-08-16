@@ -6,6 +6,7 @@ package raftstore
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -43,6 +44,7 @@ const (
 	kStateMeta       = "m3/state/meta"
 	kStateGeneration = "m3/state/generation"
 	kCatalog         = "m4/catalog/complete"
+	kReadNonce       = "m4/read/boot-nonce"
 	maxSnapshotChunk = 256 << 10
 	maxSnapshotBytes = 64 << 20
 	maxReadyEntries  = 32
@@ -67,6 +69,7 @@ type diskStore struct {
 	bootstrapPeers      []uint64
 	bootstrapIncomplete bool
 	catalogData         []byte
+	readNonce           []byte
 }
 
 func openDisk(dir string, expectedNodeID uint64, syncFail func(string) error) (*diskStore, error) {
@@ -198,6 +201,12 @@ func (d *diskStore) load(expectedNodeID uint64) error {
 				return d.corrupt("range catalog canonicality", err)
 			}
 			d.catalogData = append([]byte(nil), payload...)
+		case bytes.Equal(key, []byte(kReadNonce)):
+			payload, err := unwrapDisk(value, 15)
+			if err != nil || len(payload) != 16 {
+				return d.corrupt("read boot nonce", err)
+			}
+			d.readNonce = append([]byte(nil), payload...)
 		case bytes.Equal(key, []byte(kHardState)):
 			payload, err := unwrapDisk(value, 1)
 			if err != nil {
@@ -520,6 +529,35 @@ func (d *diskStore) catalogCopy() []byte {
 	defer d.mu.RUnlock()
 	return append([]byte(nil), d.catalogData...)
 }
+
+// rotateReadNonce durably changes the ReadIndex context namespace on every
+// open. A delayed ReadState from a prior process can therefore never satisfy
+// a request in the new process, even when the sequence counter restarts.
+func (d *diskStore) rotateReadNonce() ([]byte, error) {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("raftstore: generate read boot nonce: %w", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failed != nil {
+		return nil, d.failed
+	}
+	if err := d.beforeSync("read-boot-nonce"); err != nil {
+		d.failed = err
+		return nil, err
+	}
+	b := d.db.NewBatch()
+	if err := b.Put([]byte(kReadNonce), wrapDisk(15, nonce)); err != nil {
+		return nil, err
+	}
+	if _, err := d.db.Apply(&b); err != nil {
+		d.failed = fmt.Errorf("raftstore: persist read boot nonce: %w", err)
+		return nil, d.failed
+	}
+	d.readNonce = append([]byte(nil), nonce...)
+	return append([]byte(nil), nonce...), nil
+}
 func (d *diskStore) commitIndex() uint64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -730,7 +768,7 @@ func isKnownRaftKey(key []byte) bool {
 		bytes.Equal(key, []byte(kConfState)) || bytes.Equal(key, []byte(kConfIndex)) ||
 		bytes.Equal(key, []byte(kSnapshot)) || bytes.HasPrefix(key, []byte(kSnapshotPre)) ||
 		bytes.Equal(key, []byte(kNodeID)) || bytes.Equal(key, []byte(kBootstrap)) ||
-		bytes.HasPrefix(key, []byte(kEntryPre)) || bytes.Equal(key, []byte(kStateGeneration)) || bytes.Equal(key, []byte(kCatalog))
+		bytes.HasPrefix(key, []byte(kEntryPre)) || bytes.Equal(key, []byte(kStateGeneration)) || bytes.Equal(key, []byte(kCatalog)) || bytes.Equal(key, []byte(kReadNonce))
 }
 
 func isAnyLogicalKey(key []byte) bool {
