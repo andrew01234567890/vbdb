@@ -9,10 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"strings"
 	"sync"
-	"unicode/utf8"
 
+	"github.com/andrew01234567890/vbdb/internal/coordinates"
 	"github.com/andrew01234567890/vbdb/internal/engine"
 	"github.com/andrew01234567890/vbdb/pkg/codec"
 	"github.com/andrew01234567890/vbdb/pkg/jsondoc"
@@ -23,8 +22,8 @@ const (
 	// MaxTableBytes and MaxKeyBytes are storage invariants, not just HTTP
 	// limits. Direct users of this package must not be able to create keys the
 	// gateway could never address.
-	MaxTableBytes = 63
-	MaxKeyBytes   = 1 << 10
+	MaxTableBytes = coordinates.MaxTableBytes
+	MaxKeyBytes   = coordinates.MaxKeyBytes
 	MaxValueBytes = 1 << 20
 	// A history key is a codec tuple. String components escape NUL bytes, so
 	// the maximum key component occupies at most twice its input bytes plus
@@ -481,31 +480,12 @@ func (e *Engine) readHistoryLocked(table, key string, sequence uint64) (Row, err
 // IsReservedTable is the single M2 coordinate contract for names owned by
 // later-milestone endpoints. Both direct storage users and HTTP use it.
 func IsReservedTable(table string) bool {
-	switch table {
-	case "_admin", "_cdc", "transactions":
-		return true
-	default:
-		return false
-	}
+	return coordinates.IsReservedTable(table)
 }
 
 func validateCoordinates(table, key string) error {
-	if table == "" || key == "" || !utf8.ValidString(table) || !utf8.ValidString(key) {
+	if err := coordinates.Validate(table, key); err != nil {
 		return ErrInvalidCoordinates
-	}
-	if IsReservedTable(table) {
-		return ErrInvalidCoordinates
-	}
-	if len(table) > MaxTableBytes || len([]byte(key)) > MaxKeyBytes || strings.ContainsRune(key, '/') {
-		return ErrInvalidCoordinates
-	}
-	if table[0] < 'a' || table[0] > 'z' {
-		return ErrInvalidCoordinates
-	}
-	for i := 1; i < len(table); i++ {
-		if (table[i] < 'a' || table[i] > 'z') && (table[i] < '0' || table[i] > '9') && table[i] != '_' && table[i] != '-' {
-			return ErrInvalidCoordinates
-		}
 	}
 	return nil
 }

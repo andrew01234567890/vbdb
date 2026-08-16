@@ -1,12 +1,11 @@
 # VBDB
 
 VBDB is a Go distributed document database under active construction. This
-branch is Milestone 2: it provides a runnable, explicitly development-only
-single-node HTTP database with durable JSON documents, UUIDv7 ETags, local
-MVCC history, optimistic concurrency control, and an owned native-Go ordered
-key/value engine. It is not a distributed database: there is no Raft,
-replication, transaction coordinator, query engine, indexes, CDC, or
-multi-process cluster safety yet.
+branch is Milestone 3: it retains the explicitly development-only single-node
+HTTP database and adds an in-process RF3 Raft shard correctness harness over
+the owned native-Go ordered key/value engine. It is not a production cluster:
+transport, routing, follower-read serving, transactions, indexes, CDC,
+backup/PITR, resharding, and operator policy remain excluded.
 
 ## Requirements
 
@@ -114,8 +113,9 @@ to the persisted row/history count; constant-memory row validation is
 deferred. Those maps are not steady-state engine state. `Last` is implemented as a forward
 merge through the iterator and is correct but not performance-optimized.
 
-Future Raft apply indexes, transactions, global indexes, deduplication, and
-cross-range atomicity remain above that raw layer. Future backup/PITR will
+M3 consumes this raw layer for Raft apply-index MVCC, deterministic deduplication,
+and durable results. Transactions, global indexes, and cross-range atomicity
+remain above that raw layer. Future backup/PITR will
 require an immutable snapshot manifest plus the retained Raft journal; a local
 engine snapshot or LSN is not PITR.
 
@@ -126,6 +126,21 @@ commit, block cache, metrics system, backup/PITR integration, Raft, or
 distributed MVCC timestamp in M2. These remain later milestones. Volume
 encryption is the deployment boundary. See the [M2 ADR](docs/adr/0004-milestone2-single-node-engine.md)
 and [acceptance checklist](docs/milestones/m2.md) for the proof boundary.
+
+## M3 owned-engine Raft boundary
+
+`internal/raftstore` provides deterministic canonical commands/results,
+proposer-owned operation and row UUIDv7 values, durable dedupe and ambiguity
+retries, apply-index row history, bounded one-change membership helpers, and
+an injectable RF3 transport harness. A Ready persists Raft state first, then
+logical rows/results/applied metadata, sends messages, and calls `Advance`.
+Storage uncertainty is fatal to the replica.
+
+Raft records use opaque `m3/` keys inside `*engine.Engine`; there is no second
+WAL and no Pebble dependency. Snapshot payloads are checksummed logical streams
+staged in bounded 256 KiB generation chunks. Obsolete Pebble directories are
+rejected explicitly. See the [M3 ADR](docs/adr/0005-milestone3-owned-engine-raft.md)
+and [acceptance checklist](docs/milestones/m3.md) for the tested proof boundary.
 
 ## Packages
 
@@ -145,10 +160,13 @@ and [acceptance checklist](docs/milestones/m2.md) for the proof boundary.
   current-head semantics over the owned engine; it is the row/HTTP proof
   boundary and has no distributed policy.
 - `internal/httpapi`: direct-testable GET/PUT HTTP contract for the gateway.
+- `internal/coordinates`: shared table/key validation used by HTTP, storage,
+  and replicated commands.
+- `internal/raftstore`: bounded in-process RF3 Raft shard over the owned engine.
 
 The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
-current milestone acceptance checklist is [`docs/milestones/m2.md`](docs/milestones/m2.md);
+current milestone acceptance checklist is [`docs/milestones/m3.md`](docs/milestones/m3.md);
 the Milestone 1 checklist remains as historical context.
 
 `make public-check` is an optional local scan. It scans every commit reachable from local refs (plus a

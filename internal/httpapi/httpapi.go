@@ -10,10 +10,9 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
-	"unicode/utf8"
 
+	"github.com/andrew01234567890/vbdb/internal/coordinates"
 	"github.com/andrew01234567890/vbdb/internal/storage"
 	"github.com/andrew01234567890/vbdb/pkg/jsondoc"
 	"github.com/andrew01234567890/vbdb/pkg/uuidv7"
@@ -21,10 +20,7 @@ import (
 
 const (
 	MaxBodyBytes = storage.MaxValueBytes
-	maxKeyBytes  = storage.MaxKeyBytes
 )
-
-var tablePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 
 // Server is an HTTP handler backed by one storage engine.
 type Server struct {
@@ -51,7 +47,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "invalid_path", "The request path is not a valid table and key.")
 		return
 	}
-	if storage.IsReservedTable(table) {
+	if coordinates.IsReservedTable(table) {
 		writeProblem(w, http.StatusNotFound, "reserved_table", "This table name is reserved for a later milestone.")
 		return
 	}
@@ -184,11 +180,11 @@ func parsePath(parsed *url.URL) (string, string, error) {
 		return "", "", errors.New("path must contain exactly two segments")
 	}
 	table, err := url.PathUnescape(parts[0])
-	if err != nil || (!tablePattern.MatchString(table) && !storage.IsReservedTable(table)) {
+	if err != nil || (!coordinates.ValidTable(table) && !coordinates.IsReservedTable(table)) {
 		return "", "", errors.New("invalid table")
 	}
 	key, err := url.PathUnescape(parts[1])
-	if err != nil || key == "" || !utf8.ValidString(key) || strings.ContainsRune(key, '/') || len([]byte(key)) > maxKeyBytes {
+	if err != nil || !coordinates.ValidKey(key) {
 		return "", "", errors.New("invalid key")
 	}
 	return table, key, nil
