@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,21 +52,29 @@ func TestRunRejectsInvalidOrOverflowingMaxBytes(t *testing.T) {
 func TestRunReturnsFinalSymlinkTextWithoutFollowingTarget(t *testing.T) {
 	root := t.TempDir()
 	external := t.TempDir()
-	if err := os.WriteFile(filepath.Join(external, "secret"), []byte("external secret"), 0o600); err != nil {
+	target := filepath.Join(external, "secret")
+	if err := os.WriteFile(target, []byte("external secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(external, "secret"), filepath.Join(root, "link")); err != nil {
+	if err := os.Symlink(target, filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := run([]string{"--root", root, "--path", "link", "--max-bytes", "128"}, &output); err != nil {
+	maxBytes := strconv.Itoa(len(target))
+	if err := run([]string{"--root", root, "--path", "link", "--max-bytes", maxBytes}, &output); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != filepath.Join(external, "secret") {
+	if output.String() != target {
 		t.Fatalf("output=%q, want link text", output.String())
 	}
 	if strings.Contains(output.String(), "external secret") {
 		t.Fatal("external file bytes were followed")
+	}
+
+	output.Reset()
+	err := run([]string{"--root", root, "--path", "link", "--max-bytes", strconv.Itoa(len(target) - 1)}, &output)
+	if code := errorCode(err); code != exitTooLarge || output.Len() != 0 {
+		t.Fatalf("under-bound symlink code=%d output=%q, want code %d and empty output", code, output.String(), exitTooLarge)
 	}
 }
 

@@ -87,18 +87,36 @@ dedup result, the replicated state must durably retain bounded anti-reuse
 evidence (for example, a retired identity and request digest) or install a
 durable generation/expiry fence that verifiably excludes delayed retries. A
 retired, expired, or indeterminate identity is rejected without mutation; it
-must never fall through to blind PUT. If anti-reuse admission is exhausted, or
-the evidence/fence cannot be durably established, GC or new admission fails
-closed without acknowledging a mutation. Recovery must restore the evidence
-or fence before accepting writes. Identity reuse is permitted only after a
-durable fence proves that the old identity is safely outside the retry
-ambiguity window. The full-result population is also bounded by configured
-count and encoded-byte limits at each authenticated principal/tenant/route/
-target/range scope and by cluster-wide aggregate limits. Every fresh identity
-reserves its projected result count and bytes atomically before the row
-mutation or acknowledgement; if neither a full result slot/byte budget nor
-safe anti-reuse evidence or a generation fence can be reserved, the request is
-rejected without changing durable state.
+must never fall through to blind PUT. The M1 model selects the bounded
+full-result-retention variant: exhaustion of anti-reuse admission makes GC
+fail closed and retains every complete result; it does not by itself reject a
+fresh identity while that identity's complete result still fits the full-result
+budget. Every fresh identity reserves its complete result count and encoded
+bytes atomically before row mutation or acknowledgement. If the full-result
+count or byte budget cannot fit the complete record, fresh admission fails
+closed without changing durable state. Existing complete results continue to
+replay, and retired identities continue to reject, regardless of admission
+pressure.
+
+The complete replay-result record is version 1 and is the exact bounded unit.
+Its encoding is `VBR1` magic, version byte `0x01`, little-endian uint64 total
+record length, little-endian uint64-length-prefixed scoped identity, the same
+framing for request digest, little-endian uint16 original HTTP status,
+little-endian uint32 header count followed by each length-prefixed relevant
+response header name/value pair, and length-prefixed response body and
+envelope. The configured byte budget charges the entire encoded record,
+including all framing. Recovery re-derives the byte counter from the complete
+records and fails closed on an invalid counter or record rather than trusting a
+corrupt persisted total.
+
+With the retired-evidence variant, retired evidence is not reclaimed or
+silently discarded. Once anti-reuse capacity is exhausted, no further full
+result can be GC'd. If the retained full-result count or byte budget then
+fills, new identities are permanently unavailable for that scope across
+restart until an explicit durable generation/expiry fence or reclamation
+transition is installed, or an operator changes the configured capacity.
+Reclamation must durably establish the fence before deleting evidence; absent
+that transition, the fail-closed state is intentional and remains unchanged.
 
 Every request carrying `X-Transaction-Id` requires the response to include
 `Cache-Control: no-store, private` and `Vary: X-Transaction-Id`, including

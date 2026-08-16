@@ -38,12 +38,25 @@ result may be removed only after the same durable state contains bounded
 anti-reuse evidence or a verifiable generation/expiry fence for that identity;
 recovery must restore that evidence or fence before the replica serves writes.
 Retired, expired, or indeterminate identities are rejected without mutation,
-and exhaustion or uncertainty in anti-reuse admission fails closed rather than
-turning the identity into a fresh blind PUT. Full results also have configured
-count and encoded-byte limits at principal/tenant/route/target/range and
-cluster scopes; projected capacity is reserved atomically before a new
-identity can mutate or be acknowledged. If neither result capacity nor safe
-anti-reuse evidence/fence can be reserved, admission fails closed.
+and no identity can fall through to a fresh blind PUT. The selected bounded
+full-result-retention rule is precise: if anti-reuse admission is exhausted,
+GC fails closed and retains the complete result, while a fresh identity may be
+admitted only if its complete result fits the full-result count and encoded-
+byte budgets. A fresh identity that cannot fit those budgets is rejected
+without mutation or acknowledgement. Once those retained-result budgets fill,
+fresh admission is permanently unavailable in that scope across restart;
+retired evidence has no implicit reclamation path. Availability returns only
+after an explicit durable generation/expiry fence or reclamation transition,
+or an operator capacity change, is recorded before evidence/result deletion.
+
+The encoded-byte budget charges one exact versioned replay-result record:
+`VBR1` magic, version `0x01`, little-endian uint64 total length, identity and
+request digest with little-endian uint64 length prefixes, little-endian uint16
+original HTTP status, little-endian uint32 header count and framed relevant
+header name/value pairs, then framed body and envelope. Admission uses checked
+addition and subtractive remaining-capacity checks before mutating the row,
+result map, counters, or acknowledging the request. Recovery recomputes the
+counter from the complete records and fails closed on corrupt accounting.
 
 Every write batch is encoded completely before entering the WAL. The engine
 appends a length-bounded CRC32C frame, handles short writes, synchronizes the
