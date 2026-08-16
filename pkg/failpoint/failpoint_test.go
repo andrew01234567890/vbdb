@@ -1,0 +1,96 @@
+package failpoint
+
+import (
+	"errors"
+	"sync"
+	"testing"
+)
+
+func TestRegistryDisabledByDefaultAndExplicitlyInjectable(t *testing.T) {
+	first := New()
+	second := New()
+	if err := first.Register("before-commit"); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := first.Hit("before-commit"); err != nil || hit {
+		t.Fatal("new failpoint was enabled")
+	}
+	if hit, err := second.Hit("before-commit"); !errors.Is(err, ErrUnknown) || hit {
+		t.Fatal("unknown failpoint did not report ErrUnknown")
+	}
+	if err := first.Enable("before-commit"); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := first.Hit("before-commit"); err != nil || !hit {
+		t.Fatal("enabled failpoint did not report a hit")
+	}
+	hits, err := first.Hits("before-commit")
+	if err != nil || hits != 1 {
+		t.Fatal("enabled failpoint did not report and count a hit")
+	}
+	if second.Enabled("before-commit") {
+		t.Fatal("enabling one registry changed another")
+	}
+	if err := first.Disable("before-commit"); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := first.Hit("before-commit"); err != nil || hit {
+		t.Fatal("disabled failpoint reported a hit")
+	}
+}
+
+func TestRegistryRejectsUnknownAndEmptyNames(t *testing.T) {
+	r := New()
+	if err := r.Register(""); err == nil {
+		t.Fatal("empty name accepted")
+	}
+	if err := r.Enable("missing"); err == nil {
+		t.Fatal("unknown name accepted")
+	}
+	if err := r.Disable("missing"); err == nil {
+		t.Fatal("unknown name accepted")
+	}
+	if hit, err := r.Hit("missing"); !errors.Is(err, ErrUnknown) || hit {
+		t.Fatalf("unknown Hit() = %t, %v; want false and ErrUnknown", hit, err)
+	}
+	if hits, err := r.Hits("missing"); !errors.Is(err, ErrUnknown) || hits != 0 {
+		t.Fatalf("unknown Hits() = %d, %v; want zero and ErrUnknown", hits, err)
+	}
+	if err := r.Register("zero"); err != nil {
+		t.Fatal(err)
+	}
+	if hits, err := r.Hits("zero"); err != nil || hits != 0 {
+		t.Fatalf("registered zero-hit = %d, %v; want zero and nil", hits, err)
+	}
+}
+
+func TestRegistryRaceSafe(t *testing.T) {
+	r := New()
+	if err := r.Register("io"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Enable("io"); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 32
+	const hitsPerWorker = 1000
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < hitsPerWorker; j++ {
+				_ = r.Enabled("io")
+				_, _ = r.Hit("io")
+			}
+		}()
+	}
+	wg.Wait()
+	got, err := r.Hits("io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(workers * hitsPerWorker); got != want {
+		t.Fatalf("hit count = %d, want %d", got, want)
+	}
+}

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # go.mod pins the full patch release so security updates are
+          # deliberate, reviewable, and reproducible rather than silently
+          # changing the CI toolchain.
+          go-version-file: go.mod
+          cache: true
+      - name: Verify formatting
+        run: make fmt-check
+      - name: Formatting self-test
+        run: make fmt-check-selftest
+      - name: Vet
+        run: make vet
+      - name: Unit tests
+        run: make test
+      - name: Race tests
+        run: make race
