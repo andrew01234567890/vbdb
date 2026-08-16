@@ -100,6 +100,11 @@ type Replica struct {
 	admissionEpoch  uint64
 	closed          bool
 	fatal           error
+	reads           map[string]*pendingRead
+	retiredReads    map[string]struct{}
+	readNonce       []byte
+	readSeq         uint64
+	readBytes       int
 	done            chan struct{}
 	readyDone       chan struct{}
 	stopLoop        chan struct{}
@@ -224,9 +229,14 @@ func Open(options Options) (*Replica, error) {
 			return nil, err
 		}
 	}
+	readNonce, err := disk.rotateReadNonce()
+	if err != nil {
+		_ = disk.close()
+		return nil, err
+	}
 	config := &raft.Config{ID: options.ID, ElectionTick: options.ElectionTick, HeartbeatTick: options.HeartbeatTick, Storage: disk, Applied: disk.applied, MaxSizePerMsg: 1 << 20, MaxInflightMsgs: 128, MaxUncommittedEntriesSize: maxUncommittedEntriesSize, CheckQuorum: true, PreVote: true, StepDownOnRemoval: true, DisableProposalForwarding: true, AsyncStorageWrites: false}
 	transportCtx, transportCancel := context.WithCancel(context.Background())
-	r := &Replica{disk: disk, state: state, id: options.ID, transport: options.Transport, pending: make(map[uuidv7.UUID]*pendingProposal), done: make(chan struct{}), readyDone: make(chan struct{}), stopLoop: make(chan struct{}), transportCtx: transportCtx, transportCancel: transportCancel, appliedCh: make(chan struct{}), readyHook: options.readyHook}
+	r := &Replica{disk: disk, state: state, id: options.ID, transport: options.Transport, pending: make(map[uuidv7.UUID]*pendingProposal), reads: make(map[string]*pendingRead), retiredReads: make(map[string]struct{}), readNonce: readNonce, done: make(chan struct{}), readyDone: make(chan struct{}), stopLoop: make(chan struct{}), transportCtx: transportCtx, transportCancel: transportCancel, appliedCh: make(chan struct{}), readyHook: options.readyHook}
 	if encodedCatalog := disk.catalogCopy(); len(encodedCatalog) != 0 {
 		catalog, err := UnmarshalRangeCatalog(encodedCatalog)
 		if err != nil {
@@ -380,6 +390,12 @@ func (r *Replica) readyLoop() {
 				return
 			}
 		}
+		for _, readState := range rd.ReadStates {
+			r.deliverReadState(readState)
+			if r.fatalState() != nil {
+				return
+			}
+		}
 		if rd.SoftState != nil && rd.SoftState.RaftState != raft.StateLeader {
 			r.observeSoftState()
 			// A proposal accepted by the old leader but absent from this Ready's
@@ -437,6 +453,7 @@ func (r *Replica) fail(err error) {
 	// context timeout after the Ready loop has stopped.
 	r.signalApplied()
 	r.finishPending(err)
+	r.finishReads(err)
 }
 
 // requestFatalStop publishes a single asynchronous shutdown for every fatal
@@ -625,6 +642,9 @@ func (r *Replica) signalApplied() {
 }
 
 func (r *Replica) waitApplied(ctx context.Context, index uint64) error {
+	if ctx == nil {
+		return errors.New("raftstore: nil applied-wait context")
+	}
 	for {
 		r.stateMu.RLock()
 		applied := r.state.lastApplied
@@ -650,6 +670,13 @@ func (r *Replica) waitApplied(ctx context.Context, index uint64) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// WaitAppliedAtLeast waits for the durable logical state to include index. It
+// is the narrow freshness seam used by the M4 follower-read fence; engine LSN
+// or a local row sequence is not sufficient evidence.
+func (r *Replica) WaitAppliedAtLeast(ctx context.Context, index uint64) error {
+	return r.waitApplied(ctx, index)
 }
 
 func (r *Replica) Tick() {
@@ -1317,6 +1344,7 @@ func (r *Replica) Close() error {
 	r.closed = true
 	r.mu.Unlock()
 	r.finishPending(ErrStopped)
+	r.finishReads(ErrStopped)
 	r.stopTransport()
 	// Transport cancellation releases a blocking Send/SendSnapshot. Do not
 	// stop raft until a Ready already owned by readyLoop has persisted and
