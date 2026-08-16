@@ -15,10 +15,39 @@ temp_root=$(mktemp -d "$tmp_base/vbdb-diff-check-selftest.XXXXXX")
 repo="$temp_root/repo"
 cleanup() { rm -rf -- "$temp_root"; }
 trap cleanup EXIT
+
+configure_git_identity() {
+	local git_dir=$1
+	git -C "$git_dir" config user.name diff-check
+	git -C "$git_dir" config user.email diff-check@example.invalid
+}
+
+expect_merge_conflict() {
+	local git_dir=$1
+	local branch=$2
+	local description=$3
+	local merge_head
+	local merge_status
+	set +e
+	git -C "$git_dir" merge --no-commit "$branch" >/dev/null 2>&1
+	merge_status=$?
+	set -e
+	if ! merge_head=$(git -C "$git_dir" rev-parse -q --verify MERGE_HEAD 2>/dev/null); then
+		merge_head=
+	fi
+	if [ "$merge_status" -eq 0 ] || [ -z "$merge_head" ] ||
+		[ -z "$(git -C "$git_dir" ls-files --unmerged)" ]; then
+		printf 'diff-check-selftest: %s did not produce an actual merge conflict (status=%s)\n' \
+			"$description" "$merge_status" >&2
+		exit 1
+	fi
+}
+
 mkdir -p "$repo/scripts"
 cp "$root/scripts/diff-check-ci.sh" "$repo/scripts/diff-check-ci.sh"
 chmod 0755 "$repo/scripts/diff-check-ci.sh"
 git -C "$repo" init -q
+configure_git_identity "$repo"
 printf '%s\n' 'clean' > "$repo/data.txt"
 git -C "$repo" add data.txt scripts/diff-check-ci.sh
 git -C "$repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm initial
@@ -94,6 +123,7 @@ merge_repo="$temp_root/merge"
 mkdir -p "$merge_repo/scripts"
 cp "$root/scripts/diff-check-ci.sh" "$merge_repo/scripts/diff-check-ci.sh"
 git -C "$merge_repo" init -q
+configure_git_identity "$merge_repo"
 printf '%s\n' base > "$merge_repo/merge.txt"
 git -C "$merge_repo" add merge.txt scripts/diff-check-ci.sh
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm initial
@@ -108,14 +138,7 @@ printf '%s\n' other > "$merge_repo/merge.txt"
 git -C "$merge_repo" add merge.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm right
 git -C "$merge_repo" checkout -q left
-set +e
-git -C "$merge_repo" merge --no-commit right >/dev/null 2>&1
-merge_status=$?
-set -e
-[ "$merge_status" -ne 0 ] || {
-	printf '%s\n' 'diff-check-selftest: expected merge conflict was absent' >&2
-	exit 1
-}
+expect_merge_conflict "$merge_repo" right 'inherited-whitespace merge'
 printf '%s   \n' inherited > "$merge_repo/merge.txt"
 git -C "$merge_repo" add merge.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm 'merge inherited whitespace'
@@ -141,14 +164,7 @@ printf '%s\n' right > "$merge_repo/nested/merge.txt"
 git -C "$merge_repo" add nested/merge.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm right-resolution
 git -C "$merge_repo" checkout -q left-resolution
-set +e
-git -C "$merge_repo" merge --no-commit right-resolution >/dev/null 2>&1
-merge_status=$?
-set -e
-[ "$merge_status" -ne 0 ] || {
-	printf '%s\n' 'diff-check-selftest: expected resolution merge conflict was absent' >&2
-	exit 1
-}
+expect_merge_conflict "$merge_repo" right-resolution 'resolution merge'
 printf '%s \t\n' resolved > "$merge_repo/nested/merge.txt"
 git -C "$merge_repo" add nested/merge.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm 'merge resolution space tab'
@@ -176,14 +192,7 @@ printf '%s\n' right > "$merge_repo/nested/middle.txt"
 git -C "$merge_repo" add nested/blank.txt nested/middle.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm right-blank
 git -C "$merge_repo" checkout -q left-blank
-set +e
-git -C "$merge_repo" merge --no-commit right-blank >/dev/null 2>&1
-merge_status=$?
-set -e
-[ "$merge_status" -ne 0 ] || {
-	printf '%s\n' 'diff-check-selftest: expected blank-line merge conflict was absent' >&2
-	exit 1
-}
+expect_merge_conflict "$merge_repo" right-blank 'blank-line merge'
 printf '%s\n\n' resolved > "$merge_repo/nested/blank.txt"
 printf '%s\n\n%s\n' first second > "$merge_repo/nested/middle.txt"
 git -C "$merge_repo" add nested/blank.txt nested/middle.txt
@@ -218,14 +227,7 @@ printf '%s\n%s\n' other tail > "$merge_repo/nested/middle-only.txt"
 git -C "$merge_repo" add nested/middle-only.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm right-middle
 git -C "$merge_repo" checkout -q left-middle
-set +e
-git -C "$merge_repo" merge --no-commit right-middle >/dev/null 2>&1
-merge_status=$?
-set -e
-[ "$merge_status" -ne 0 ] || {
-	printf '%s\n' 'diff-check-selftest: expected middle-only merge conflict was absent' >&2
-	exit 1
-}
+expect_merge_conflict "$merge_repo" right-middle 'middle-only merge'
 printf '%s\n\n%s\n' first tail > "$merge_repo/nested/middle-only.txt"
 git -C "$merge_repo" add nested/middle-only.txt
 git -C "$merge_repo" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm 'merge middle blank'
@@ -247,6 +249,7 @@ fetch_clone="$temp_root/fetch-clone"
 mkdir -p "$fetch_source/scripts"
 cp "$root/scripts/diff-check-ci.sh" "$fetch_source/scripts/diff-check-ci.sh"
 git -C "$fetch_source" init -q
+configure_git_identity "$fetch_source"
 printf '%s\n' base > "$fetch_source/data.txt"
 git -C "$fetch_source" add data.txt scripts/diff-check-ci.sh
 git -C "$fetch_source" -c user.name=diff-check -c user.email=diff-check@example.invalid commit -qm initial
