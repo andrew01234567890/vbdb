@@ -1,11 +1,13 @@
 # VBDB
 
 VBDB is a Go distributed document database under active construction. This
-branch is Milestone 3: it retains the explicitly development-only single-node
-HTTP database and adds an in-process RF3 Raft shard correctness harness over
-the owned native-Go ordered key/value engine. It is not a production cluster:
-transport, routing, follower-read serving, transactions, indexes, CDC,
-backup/PITR, resharding, and operator policy remain excluded.
+branch is Milestone 4: it retains the explicitly development-only single-node
+HTTP database and the in-process RF3 Raft shard harness, then proves bounded
+ReadIndex fencing, canonical range catalogs, one source-to-two-child split
+transfer, and one fenced cutover over the owned native-Go engine. It is not a
+production cluster: transport/RPC, independent child Raft lifecycle,
+automatic placement policy, transactions, indexes, CDC, backup/PITR, and
+operator reconciliation remain excluded.
 
 ## Requirements
 
@@ -45,6 +47,18 @@ Version checks work now:
 go run ./cmd/vbdbd --version
 go run ./cmd/vbdb-operator --version
 ```
+
+## M4 boundary
+
+The deterministic M4 proof is documented in [`docs/milestones/m4.md`](docs/milestones/m4.md)
+and [`docs/adr/0006-milestone4-online-reshard.md`](docs/adr/0006-milestone4-online-reshard.md).
+Routed reads require a quorum ReadIndex, durable logical applied-index wait,
+and complete route-fence revalidation. Split transfer uses bounded checksummed
+chunks, ordered deltas, projected catch-up, and a single complete catalog
+replacement with a retired source tombstone. The split harness uses RF3-shaped
+in-process state; it is not independent child groups or production transport.
+Incomplete generations and uncertain catalog publication fail closed, and the
+process-local split coordinator is not claimed to resume after a crash.
 
 Run the standalone development gateway with a temporary data directory:
 

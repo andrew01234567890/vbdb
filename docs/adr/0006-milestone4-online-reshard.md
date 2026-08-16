@@ -15,11 +15,11 @@ coverage from negative to positive infinity, and re-encodes to reject a
 non-canonical representation. APIs return defensive copies. `COPYING` and
 `CATCHING_UP` descriptors are never routable.
 
-This first slice defines vocabulary and pure validation only. Durable catalog
-publication, ReadIndex serving, split transfer, and cutover are supplied by
-the higher stacked slices. M4 remains a deterministic in-process proof; it
-does not claim production routing RPC, independent child Raft lifecycle, or
-automatic reshard policy.
+The range-contract slice defines vocabulary and pure validation; the higher
+stacked slices add durable catalog publication, ReadIndex serving, bounded
+transfer, and one fenced cutover. M4 remains a deterministic in-process
+proof; it does not claim production routing RPC, independent child Raft
+lifecycle, or automatic reshard policy.
 
 ## Durable catalog boundary
 
