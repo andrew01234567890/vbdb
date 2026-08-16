@@ -298,6 +298,13 @@ func (h *SplitHarness) CatchUp() error {
 	right := cloneTransferMap(h.operation.rightRows)
 	leftApplied, rightApplied := h.operation.leftApplied, h.operation.rightApplied
 	for _, delta := range ordered {
+		if err := validateSplitDelta(h.operation, delta); err != nil {
+			return err
+		}
+		digest, err := splitDeltaDigest(delta)
+		if err != nil || h.operation.deltaDigests[delta.Sequence] != digest {
+			return ErrSplitChecksum
+		}
 		if delta.Sequence != leftApplied+1 && delta.Sequence != rightApplied+1 {
 			return ErrSplitDeltaOrder
 		}
