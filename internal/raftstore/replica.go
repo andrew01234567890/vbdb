@@ -89,7 +89,9 @@ type Replica struct {
 	transport Transport
 
 	stateMu      sync.RWMutex
+	catalogMu    sync.RWMutex
 	mu           sync.Mutex
+	rangeCatalog *RangeCatalog
 	pending      map[uuidv7.UUID]*pendingProposal
 	pendingBytes int
 	// admissionEpoch fences proposal registration against a SoftState
@@ -225,6 +227,18 @@ func Open(options Options) (*Replica, error) {
 	config := &raft.Config{ID: options.ID, ElectionTick: options.ElectionTick, HeartbeatTick: options.HeartbeatTick, Storage: disk, Applied: disk.applied, MaxSizePerMsg: 1 << 20, MaxInflightMsgs: 128, MaxUncommittedEntriesSize: maxUncommittedEntriesSize, CheckQuorum: true, PreVote: true, StepDownOnRemoval: true, DisableProposalForwarding: true, AsyncStorageWrites: false}
 	transportCtx, transportCancel := context.WithCancel(context.Background())
 	r := &Replica{disk: disk, state: state, id: options.ID, transport: options.Transport, pending: make(map[uuidv7.UUID]*pendingProposal), done: make(chan struct{}), readyDone: make(chan struct{}), stopLoop: make(chan struct{}), transportCtx: transportCtx, transportCancel: transportCancel, appliedCh: make(chan struct{}), readyHook: options.readyHook}
+	if encodedCatalog := disk.catalogCopy(); len(encodedCatalog) != 0 {
+		catalog, err := UnmarshalRangeCatalog(encodedCatalog)
+		if err != nil {
+			_ = disk.close()
+			return nil, fmt.Errorf("raftstore: load range catalog: %w", err)
+		}
+		if err := catalog.ValidateAgainstVoters(disk.confStateCopy().GetVoters()); err != nil {
+			_ = disk.close()
+			return nil, fmt.Errorf("raftstore: persisted range catalog membership: %w", err)
+		}
+		r.rangeCatalog = catalog
+	}
 	if (fresh || incompleteBootstrap) && last == 0 {
 		r.node = raft.StartNode(config, options.Peers)
 	} else {
@@ -1123,6 +1137,81 @@ func (r *Replica) LookupResult(operationID uuidv7.UUID) (Result, bool, error) {
 		result = cloneResult(result)
 	}
 	return result, ok, nil
+}
+
+// InstallRangeCatalog durably replaces the complete route image and publishes
+// its pointer only after the owned engine has synced the canonical bytes. A
+// failed or uncertain publication enters the same fatal boundary as other
+// durable state failures; no partial route can be served.
+func (r *Replica) InstallRangeCatalog(catalog *RangeCatalog) error {
+	if catalog == nil {
+		return ErrCatalogCorrupt
+	}
+	if err := r.readOpen(); err != nil {
+		return err
+	}
+	encoded, err := catalog.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	validated, err := UnmarshalRangeCatalog(encoded)
+	if err != nil {
+		return err
+	}
+	r.catalogMu.Lock()
+	defer r.catalogMu.Unlock()
+	previous := r.rangeCatalog
+	if previous != nil {
+		if err := validateCatalogReplacement(previous, validated); err != nil {
+			return err
+		}
+		encoded, err = validated.MarshalBinary()
+		if err != nil {
+			return err
+		}
+	}
+	if err := validated.ValidateAgainstVoters(r.disk.confStateCopy().GetVoters()); err != nil {
+		return err
+	}
+	if err := r.disk.persistCatalog(encoded); err != nil {
+		r.fail(err)
+		return err
+	}
+	r.rangeCatalog = validated
+	return nil
+}
+
+// RangeCatalog returns a decoded defensive copy of the last durably
+// installed image. A nil result means this replica has no routing authority.
+func (r *Replica) RangeCatalog() (*RangeCatalog, error) {
+	if err := r.readOpen(); err != nil {
+		return nil, err
+	}
+	r.catalogMu.RLock()
+	catalog := r.rangeCatalog
+	if catalog == nil {
+		r.catalogMu.RUnlock()
+		return nil, nil
+	}
+	encoded, err := catalog.MarshalBinary()
+	r.catalogMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	return UnmarshalRangeCatalog(encoded)
+}
+
+// RouteRange checks a complete caller-supplied route fence. Group identity is
+// mandatory; stale routes return a typed moved error and never authorize data.
+func (r *Replica) RouteRange(key []byte, rangeID string, generation, ownerEpoch, groupID uint64) (RangeDescriptor, error) {
+	catalog, err := r.RangeCatalog()
+	if err != nil {
+		return RangeDescriptor{}, err
+	}
+	if catalog == nil {
+		return RangeDescriptor{}, ErrCatalogCorrupt
+	}
+	return catalog.RouteAt(append([]byte(nil), key...), rangeID, generation, ownerEpoch, groupID)
 }
 
 // Status is a nonblocking diagnostic snapshot. Once Close wins the lifecycle
