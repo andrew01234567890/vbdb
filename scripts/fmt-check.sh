@@ -2,8 +2,12 @@
 # Verify every Go file without word-splitting paths, a cwd dependency, or an
 # unbounded command line.
 set -u
+export LC_ALL=C
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if ! root=$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd -P); then
+	printf '%s\n' 'fmt-check: unable to canonicalize repository root' >&2
+	exit 2
+fi
 manifest=$(mktemp "${TMPDIR:-/tmp}/vbdb-fmt-check.XXXXXX") || {
 	printf '%s\n' 'fmt-check: unable to create file manifest' >&2
 	exit 2

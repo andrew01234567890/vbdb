@@ -45,6 +45,93 @@ QUERY requests carrying that same transaction ID. Those reads overlay the
 transaction's latest staged PUTs on committed read-committed state and return
 their candidate versions; requests without that ID and other transactions see
 only committed data. Transactional PUT returns 202 with a candidate version.
+
+Every successful staged mutation has one authoritative replicated transaction
+record before the gateway returns 202. The record contains a separate
+non-secret logical transaction ID (the bearer is only a lookup capability), a
+per-transaction request sequence and/or stable
+`Idempotency-Key`, target row key, immutable committed baseline (absence or
+the exact committed row version and value digest), candidate row value and
+candidate `_version`, and the operation digest. The candidate version is
+proposed once by the proposer (UUIDv7), stored in that record, and carried
+unchanged by every replica and apply/replay path; replicas never mint a new
+version while applying it. A 202 acknowledges this complete staged state, not
+gateway memory. Failover recovery replays the record and restores the same
+baseline, candidate, version, request sequence, and idempotency identity
+before serving the transaction; a missing or checksum-invalid record is
+fail-closed and cannot be reconstructed from a partial candidate.
+Autocommit writes use the same proposer-once `_version` rule in their durable
+logical transaction record; retries and replica apply never mint a replacement
+version.
+
+Creation and every idempotent replay response, including a creation request
+that has no `X-Transaction-Id`, carries `Cache-Control: no-store, private` and
+`Vary: X-Transaction-Id`. A bearer capability is never cacheable or written to
+an access log, application log, trace, metric, or error.
+
+`Idempotency-Key` is the public stable retry identity for every mutating
+request, including transaction creation, autocommit PUTs, staged PUTs, and
+terminal transaction operations. It is opaque and scoped by authenticated
+principal, route, and
+target. The replicated dedup record retains the request digest and original
+HTTP result for the configured dedup horizon (at least the transaction
+deadline plus the gateway-retry window). A retry with the same identity and
+digest replays that result after gateway restart; reuse with a different
+digest returns 409. Replay consults the durable dedup/operation record before
+applying anything, so it cannot clobber a newer write. A request sequence is
+still recorded for transaction history and ordering even when an idempotency
+identity is supplied.
+
+Every request carrying `X-Transaction-Id` requires the response to include
+`Cache-Control: no-store, private` and `Vary: X-Transaction-Id`, including
+transactional PUT (202), GET/QUERY overlays, and transaction status and
+terminal responses. Gateways and services must never log the bearer value or
+place it in CDC positions, CDC event payloads, metrics labels, traces, or
+error text. This also applies to autocommit requests: an autocommit mutation
+has a separate logical transaction/event ID in its replicated record and CDC
+event, and has no bearer capability at all.
+
+The staged row/byte and transaction counts are bounded: at most 10,000 staged
+rows and 64 MiB of staged canonical row bytes per open transaction. Each
+transaction also reserves at most 4 MiB of encoded CDC metadata (logical event
+ID, participant set, and operation metadata), so its complete logical CDC event
+has a hard 68 MiB encoded limit. Admission
+is atomic across the authenticated principal and tenant (at most 32 open
+transactions each) and the cluster (at most 100,000 non-terminal `OPEN` or
+`PREPARING` transactions): the replicated admission record reserves capacity
+before creation or staging, so concurrent gateways cannot oversubscribe either
+scope. A projected encoded event above 68 MiB, or a missing reservation for its
+complete event bytes, is rejected atomically with 413/429 before staged 202.
+Commit performs the same reservation with the journal and delivery queues; if
+the complete event cannot fit, commit remains non-terminal and returns
+retryable 429 rather than publishing a partial event. Cursors are bounded per
+principal/tenant (64 open cursors) and cluster
+(10,000), with a 16 KiB opaque state token, a 64 MiB frozen snapshot-plus-
+overlay, at most 1,000 rows per page, and a 4 MiB response. The cursor's
+snapshot is retained by reference, not copied without accounting. Exceeding a
+bound returns 413 or 429 without changing durable state.
+
+The MVCC contract also bounds retained state: each range admits at most 8 GiB
+or 100 million retained versions for active snapshots and enforces a 24-hour
+minimum horizon. Before GC could cross an active cursor's horizon, admission
+backpressures new snapshots/writes with retryable 429/503 and does not delete
+history; if accounting or GC coordination is uncertain it fails closed. A
+cursor whose snapshot is beyond the durably advertised horizon returns 410.
+CDC bounds each complete encoded logical event to 68 MiB, each stream queue to
+256 MiB and 10,000 events, and the cluster to 1,000 streams. Queue admission
+accounts encoded bytes, not just event count, and cannot split one logical
+event into independently acknowledged events. Capacity pressure returns 429
+with a retryable error rather than dropping or reordering events. Operators
+configure `cdc.retention.window` (default 24 hours; values below 24 hours are
+invalid) and `cdc.retention.bytes` (default 4 GiB per range, a soft byte
+budget). The byte budget never evicts an event still inside the configured
+window: if no event is older than that window, journal/queue admission applies
+backpressure or fails closed with retryable 429/503. Once an event is older
+than the configured window and its frontier is durably closed, the byte budget
+may evict old events; the range advances its earliest-available frontier and a
+cursor/`Last-Event-ID` before that frontier returns 410. Operators may raise
+limits but may not reduce the retention window or remove these bounds.
+
 GET evaluates the overlay at request invocation. A cursor-based transactional
 QUERY freezes the staged overlay/write-set snapshot together with its first
 page's immutable statement snapshot; later staged PUTs appear only in a new
@@ -62,7 +149,7 @@ candidate while staging (a miss is 412), but cannot erase or weaken the
 committed-state baseline. A first blind PUT establishes a blind committed-state
 baseline; a later If-Match(candidate) can validate the private candidate for
 staging but does not convert that original baseline into a conditional write.
-Read-committed statements prohibit G1 dirty reads, intermediate reads, and
+Read-committed statements prohibit G0 dirty writes, G1 dirty reads, intermediate reads, and
 circular information-flow observations: a statement observes only committed
 state and never a partial transaction. Statement-to-statement nonrepeatable
 reads and phantoms are allowed, as are write skew and other anomalies not
@@ -126,31 +213,47 @@ unique mismatch returns 409 and aborts. Replicated participant prepare intents
 are installed as part of that same participant prepare transition. Every
 participant must be prepared before one replicated transaction decision becomes the
 linearization point. While `OPEN`, staged data remains private and holds no
-locks or intents; prepare intents and reservations exist only during commit. If
-the time authority is unavailable, fail-closed `PREPARING` reservations may
-remain unbounded until a replicated decision is possible; this is an
-intentional availability trade. GET and QUERY that encounter an intent resolve
+locks or intents; prepare intents and reservations exist only during commit. The
+prepare record contains a replicated `prepare_deadline` no later than the
+transaction deadline plus a fixed 30-second resolver grace. A quorum resolver
+with a live replicated lease must drive `COMMITTED`, `ROLLED_BACK`, or `EXPIRED`
+before that deadline; the lease and deadline are state-machine data, not a
+local wall-clock timer. If the resolver loses quorum or the time bound is
+uncertain, participants keep the reservation and affected requests fail closed
+with retryable 503 until a new resolver can safely decide; they never locally
+expire or release a prepare. Thus resolution is bounded whenever the declared
+resolver liveness holds, while a partition preserves safety rather than
+inventing an unsafe expiry. GET and QUERY that encounter an intent resolve
 it against the recorded decision: `COMMITTED` is visible atomically, while abort or `EXPIRED` intents
 are ignored and removed. Materialization lag cannot expose a cross-shard
 fracture. Recovery and failover replay the decision and intents before serving
-the same visibility rule; an unresolved prepare remains hidden and retryable.
+the same visibility rule. An unresolved prepare is hidden; if its earliest
+possible commit timestamp is at or before the request snapshot T, the range
+must wait for the replicated decision or return retryable 503. It may be
+skipped only with durable evidence that its commit (if any) is strictly after
+T. The same rule applies to the global statement snapshot and every cursor
+page: a freshness fence must prove each range has applied through T and has no
+unresolved prepare that could commit at or before T.
 
 CDC uses `GET /_cdc` or `GET /_cdc/{table}` with `Accept: text/event-stream`.
 The stream returns 200 and emits one event per committed logical transaction,
 at-least-once, and resumes with `Last-Event-ID`. A position is the totally
-ordered composite `(commit HLC, stable transaction ID)`. Each range persists
+ordered composite `(commit HLC, logical event ID)`. Each range persists
 progress and an inclusive closed frontier `W`: every committed event at a
 position `<= W` is durably enumerable from that range, and no later event can
 appear at or below `W`. The merger chooses the inclusive global frontier
 `F = min(W)` across participating ranges and emits only positions `<= F`;
 therefore every emitted position is enumerable everywhere needed before it is
-released, and a slow range cannot be skipped. The transaction ID is the stable
-event tiebreak/deduplication key. Range journals persist participant fragments
-keyed by that transaction ID and the declared participant set; the merger waits
-until every fragment is enumerable through the fenced frontier, assembles one
-complete logical event, and only then emits it. Consumer deduplication therefore
-cannot drop mutation fragments. One logical committed transaction yields one
-event even when it spans ranges.
+released, and a slow range cannot be skipped. The logical event ID (a separate
+non-secret random/ordered identifier) is the stable event tiebreak/deduplication
+key. It is never the `X-Transaction-Id` bearer capability, and the bearer or
+verifier must not enter journal, CDC, metrics, trace, or log fields. Range
+journals persist participant fragments keyed by the logical event ID and the
+declared participant set; the merger waits until every fragment is enumerable
+through the fenced frontier, assembles one complete logical event, and only
+then emits it. Consumer deduplication therefore cannot drop mutation
+fragments. One logical committed transaction yields one event even when it
+spans ranges. Autocommit has exactly the same logical event-ID rule.
 Each range's `W` is a durable, replicated monotonic value: after restart or
 leader change, a replacement leader may advertise only the last durably
 validated frontier or a later one justified by the same journal evidence, never
@@ -163,9 +266,16 @@ with an unproven wall-clock assumption. The merger's range membership is fenced
 by a catalog generation: a split child joins only after its creation frontier
 is durably established, and a removed range cannot be omitted until its final
 frontier is included. This keeps the minimum frontier in one ordering domain.
-`cdc.retention` defaults to 24 hours and a cursor older than retained history
-returns 410 with the earliest available position. The ordering merger,
-frontiers, and journal are later-milestone mechanisms, not implemented here.
+`cdc.retention.window` defaults to 24 hours and is a hard minimum configurable
+window; `cdc.retention.bytes` defaults to 4 GiB per range and is a soft budget.
+The journal must retain every event within the configured window even when the
+byte budget is full, applying backpressure/fail-closed admission instead of
+shortening the window. After the window elapses, the byte budget may evict only
+durably closed older events. Each range publishes the resulting earliest
+available position, and a cursor or `Last-Event-ID` before it returns 410 with
+that frontier. Stream and queue limits are the bounded values above. The
+ordering merger, frontiers, and journal are later-milestone mechanisms, not
+implemented here.
 
 `_admin`, `_cdc`, and `transactions` are reserved names. Authentication,
 authorization, TLS, schema administration, and actual route handlers are later

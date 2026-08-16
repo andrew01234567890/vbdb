@@ -28,6 +28,15 @@ const MaxDepth = 128
 // canonicalization work in addition to the nesting bound.
 const MaxDocumentBytes = 1 << 20
 
+// MaxCanonicalBytes bounds the compact canonical output. JSON escaping can
+// expand a valid input (for example, HTML-sensitive bytes), so the output has
+// its own limit. encoding/json may transiently build the escaped result before
+// this check (at most the fixed escape expansion of MaxDocumentBytes); together
+// with MaxDocumentBytes and MaxDepth this remains a fixed bound. Value's
+// defensive copy is at most another MaxCanonicalBytes-scale allocation plus
+// Go's map/slice headers.
+const MaxCanonicalBytes = 4 << 20
+
 // Document is a validated JSON document and its deterministic representation.
 // The decoded value retains every number as json.Number, never float64.
 type Document struct {
@@ -62,6 +71,9 @@ func Parse(input []byte) (Document, error) {
 	canonical, err := json.Marshal(value)
 	if err != nil {
 		return Document{}, fmt.Errorf("jsondoc: canonical encoding: %w", err)
+	}
+	if len(canonical) > MaxCanonicalBytes {
+		return Document{}, fmt.Errorf("jsondoc: canonical document exceeds %d bytes", MaxCanonicalBytes)
 	}
 	return Document{value: value, canonical: canonical}, nil
 }

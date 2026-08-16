@@ -27,6 +27,9 @@ const int64SignMask uint64 = 1 << 63
 type Kind byte
 
 const (
+	// InvalidKind is never a persisted format-v1 tag. It marks a zero or
+	// deferred-error Component so callers cannot mistake it for a usable value.
+	InvalidKind Kind = 0x00
 	// These numeric assignments are persistent format-v1 tags. Do not use
 	// iota here: adding or reordering a kind must never rewrite old keys.
 	BytesKind  Kind = 0x01
@@ -37,7 +40,8 @@ const (
 )
 
 // Component is one typed value in a tuple. Construct components with the
-// constructors below; a zero Component is invalid.
+// constructors below; a zero Component and a deferred constructor failure are
+// invalid. Err and Valid expose that state explicitly.
 type Component struct {
 	kind Kind
 	data []byte
@@ -52,7 +56,7 @@ type Component struct {
 func Bytes(value []byte) Component {
 	component, err := bytesChecked(value)
 	if err != nil {
-		return Component{kind: BytesKind, err: err}
+		return Component{kind: InvalidKind, err: err}
 	}
 	return component
 }
@@ -104,7 +108,20 @@ func Bool(value bool) Component {
 	return Component{kind: BoolKind, data: []byte{0}}
 }
 
-func (c Component) Kind() Kind { return c.kind }
+// Err reports a deferred constructor error or malformed component state.
+// Persisted kind tags are unchanged; InvalidKind is only an in-memory state.
+func (c Component) Err() error { return validate(c) }
+
+// Valid reports whether the component can be encoded or compared.
+func (c Component) Valid() bool { return c.Err() == nil }
+
+// Kind returns InvalidKind for an invalid or deferred-error component.
+func (c Component) Kind() Kind {
+	if c.Err() != nil {
+		return InvalidKind
+	}
+	return c.kind
+}
 
 func (c Component) Bytes() ([]byte, error) {
 	if c.err != nil {
@@ -118,6 +135,9 @@ func (c Component) Bytes() ([]byte, error) {
 
 // Text returns the string value of a StringKind component.
 func (c Component) Text() (string, error) {
+	if c.err != nil {
+		return "", c.err
+	}
 	if c.kind != StringKind {
 		return "", fmt.Errorf("codec: component is %s, not string", c.kind)
 	}
@@ -125,6 +145,9 @@ func (c Component) Text() (string, error) {
 }
 
 func (c Component) Int64() (int64, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	if c.kind != Int64Kind {
 		return 0, fmt.Errorf("codec: component is %s, not int64", c.kind)
 	}
@@ -135,6 +158,9 @@ func (c Component) Int64() (int64, error) {
 }
 
 func (c Component) Uint64() (uint64, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	if c.kind != Uint64Kind {
 		return 0, fmt.Errorf("codec: component is %s, not uint64", c.kind)
 	}
@@ -145,6 +171,9 @@ func (c Component) Uint64() (uint64, error) {
 }
 
 func (c Component) Bool() (bool, error) {
+	if c.err != nil {
+		return false, c.err
+	}
 	if c.kind != BoolKind {
 		return false, fmt.Errorf("codec: component is %s, not bool", c.kind)
 	}
@@ -272,12 +301,12 @@ func validate(c Component) error {
 	}
 	switch c.kind {
 	case BytesKind:
-		return nil
+		return checkVariableBytesBudget(1, c.data)
 	case StringKind:
 		if !utf8.Valid(c.data) {
 			return errors.New("codec: string is not valid UTF-8")
 		}
-		return nil
+		return checkVariableBytesBudget(1, c.data)
 	case Int64Kind, Uint64Kind:
 		if len(c.data) != 8 {
 			return errors.New("codec: numeric component has invalid width")
@@ -395,7 +424,7 @@ func readEscaped(encoded []byte, offset int) ([]byte, int, error) {
 
 // Equal reports whether two components have identical canonical values.
 func Equal(a, b Component) bool {
-	if a.err != nil || b.err != nil {
+	if a.Err() != nil || b.Err() != nil {
 		return false
 	}
 	return a.kind == b.kind && bytes.Equal(a.data, b.data)

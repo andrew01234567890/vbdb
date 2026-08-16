@@ -28,7 +28,11 @@ type Clock interface {
 var _ Clock = Real{}
 var _ Clock = (*Manual)(nil)
 
-// Real is the production clock backed by the standard library.
+// Real is the production clock backed by the standard library. Its channel
+// capacity follows Go's asynctimerchan setting (the module pins synchronous
+// capacity zero by default). Manual timers intentionally use a one-element
+// buffered channel so Advance can deliver deterministically while holding the
+// clock lock; callers must not use channel capacity as a clock contract.
 type Real struct{}
 
 func (Real) Now() time.Time { return time.Now() }
@@ -53,6 +57,21 @@ type Manual struct {
 	mu     sync.Mutex
 	now    time.Time
 	timers map[*manualTimer]struct{}
+}
+
+// Prune abandons all currently active timers and releases the Manual clock's
+// references to them. It is useful for test teardown when a test intentionally
+// leaves timers unread; normal code should Stop timers it owns. Timers already
+// delivered or stopped are removed as part of their normal operation.
+func (c *Manual) Prune() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := len(c.timers)
+	for timer := range c.timers {
+		timer.active = false
+		delete(c.timers, timer)
+	}
+	return count
 }
 
 func NewManual(start time.Time) *Manual {

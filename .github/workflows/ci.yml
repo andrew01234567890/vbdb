@@ -16,6 +16,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
+          # go.mod pins the full patch release so security updates are
+          # deliberate, reviewable, and reproducible rather than silently
+          # changing the CI toolchain.
           go-version-file: go.mod
           cache: true
       - name: Verify formatting
@@ -39,6 +42,4 @@ jobs:
           VBDB_EVENT_NAME: ${{ github.event_name }}
           VBDB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           VBDB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
-          VBDB_ALLOW_DIFF_FETCH: '1'
-          VBDB_FETCH_REMOTE: origin
         run: make diff-check-ci

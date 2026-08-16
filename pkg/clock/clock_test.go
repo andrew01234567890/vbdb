@@ -34,6 +34,20 @@ func TestRealClockNowTimerAndStop(t *testing.T) {
 	}
 }
 
+func TestManualTimerChannelCapacityAndPrune(t *testing.T) {
+	manual := NewManual(time.Unix(0, 0))
+	timer := manual.NewTimer(time.Hour)
+	if got := cap(timer.C()); got != 1 {
+		t.Fatalf("manual timer channel capacity = %d, want one buffered slot", got)
+	}
+	if got := manual.Prune(); got != 1 {
+		t.Fatalf("Prune removed %d timers, want one", got)
+	}
+	if timer.Stop() {
+		t.Fatal("pruned timer still reported active")
+	}
+}
+
 func TestRealTimerChannelSemanticsArePinned(t *testing.T) {
 	// The module's godebug directive makes this synchronous (cap 0). Running
 	// this package with GODEBUG=asynctimerchan=1 intentionally fails here and

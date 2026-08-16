@@ -251,3 +251,58 @@ func TestTextAccessorIsExplicit(t *testing.T) {
 		t.Fatalf("Text() = %q, %v", got, err)
 	}
 }
+
+func TestInvalidDeferredComponentPropagatesThroughEveryAccessor(t *testing.T) {
+	invalid := Bytes(make([]byte, MaxTupleBytes))
+	if invalid.Valid() {
+		t.Fatal("deferred constructor failure reported as valid")
+	}
+	if invalid.Err() == nil {
+		t.Fatal("deferred constructor failure was not exposed")
+	}
+	if invalid.Kind() != InvalidKind {
+		t.Fatalf("invalid component Kind() = %v, want InvalidKind", invalid.Kind())
+	}
+	if Equal(invalid, invalid) {
+		t.Fatal("Equal treated a deferred-error component as a value")
+	}
+	if _, err := invalid.Bytes(); err == nil {
+		t.Fatal("Bytes accessor accepted deferred constructor error")
+	}
+	if _, err := invalid.Text(); err == nil {
+		t.Fatal("Text accessor discarded deferred constructor error")
+	}
+	if _, err := invalid.Int64(); err == nil {
+		t.Fatal("Int64 accessor discarded deferred constructor error")
+	}
+	if _, err := invalid.Uint64(); err == nil {
+		t.Fatal("Uint64 accessor discarded deferred constructor error")
+	}
+	if _, err := invalid.Bool(); err == nil {
+		t.Fatal("Bool accessor discarded deferred constructor error")
+	}
+}
+
+func TestInvalidZeroAndMalformedComponentsAreNotValues(t *testing.T) {
+	var zero Component
+	if zero.Valid() || zero.Err() == nil || zero.Kind() != InvalidKind {
+		t.Fatalf("zero component state: valid=%v err=%v kind=%v", zero.Valid(), zero.Err(), zero.Kind())
+	}
+	if Equal(zero, zero) {
+		t.Fatal("Equal treated zero component as a value")
+	}
+	malformed := Component{kind: Int64Kind, data: []byte{1}}
+	if malformed.Valid() || malformed.Err() == nil || malformed.Kind() != InvalidKind {
+		t.Fatalf("malformed component state: valid=%v err=%v kind=%v", malformed.Valid(), malformed.Err(), malformed.Kind())
+	}
+	if Equal(malformed, malformed) {
+		t.Fatal("Equal treated malformed component as a value")
+	}
+	oversized := Component{kind: BytesKind, data: make([]byte, MaxTupleBytes)}
+	if oversized.Valid() || oversized.Err() == nil || oversized.Kind() != InvalidKind {
+		t.Fatalf("oversized component state: valid=%v err=%v kind=%v", oversized.Valid(), oversized.Err(), oversized.Kind())
+	}
+	if Equal(oversized, oversized) {
+		t.Fatal("Equal treated oversized component as a value")
+	}
+}

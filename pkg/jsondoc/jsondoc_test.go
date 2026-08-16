@@ -93,6 +93,16 @@ func TestDocumentSizeBoundaryAndRedactedInvalidNumber(t *testing.T) {
 	}
 }
 
+func TestCanonicalOutputBoundRejectsExpansion(t *testing.T) {
+	input := []byte(`{"value":"` + strings.Repeat("<", MaxDocumentBytes-12) + `"}`)
+	if len(input) > MaxDocumentBytes {
+		t.Fatalf("test input unexpectedly exceeds input bound: %d", len(input))
+	}
+	if _, err := Parse(input); err == nil {
+		t.Fatal("accepted canonical output above MaxCanonicalBytes")
+	}
+}
+
 func TestTrailingValueErrorDoesNotEchoContent(t *testing.T) {
 	trailing := "gh" + "p_" + "publiccheckfixtureabcdefghijklmnopqrstuvwxyz123456"
 	_, err := Parse([]byte(`1 ` + trailing))

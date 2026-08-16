@@ -41,7 +41,13 @@ canonical spellings. `encoding/json` HTML escaping remains deliberate in
 canonical v1: `<`, `>`, `&`, U+2028, and U+2029 are emitted using the standard
 `\u003c`, `\u003e`, `\u0026`, `\u2028`, and `\u2029` escapes; this is deterministic
 escaping, not an RFC 8785/JCS claim.
-`Document.Value` returns a deep copy, so callers cannot mutate the persisted
+Canonical output is bounded separately at `MaxCanonicalBytes = 4 MiB`; this
+covers expansion from HTML/control escaping. `encoding/json` may transiently
+build the escaped result before that check, but its expansion is bounded by
+the fixed 1 MiB input and JSON escape forms. The input, canonical bytes, and
+one defensive `Document.Value` copy are therefore bounded by fixed byte
+limits (plus Go map/slice header overhead), rather than by an unbounded
+caller-controlled expansion. `Document.Value` returns a deep copy, so callers cannot mutate the persisted
 representation through the decoded map or slices. The zero `Document` is the
 explicit canonical JSON null value: `Bytes` returns `null` and `Value` returns
 `nil`.

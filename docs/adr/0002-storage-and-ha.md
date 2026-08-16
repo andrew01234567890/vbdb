@@ -5,18 +5,64 @@
 
 ## Decision
 
-Production code is native Go. Pebble is the local durable storage engine and
+Production code is native Go. VBDB owns its local durable storage engine and
 `etcd/raft` provides one consensus group per logical shard. A shard has RF3
 voting replicas across three failure zones. Writes require a persisted quorum;
-VBDB fails closed after quorum loss and never auto-promotes a minority.
+VBDB fails closed after quorum loss and never auto-promotes a minority. RF3 is
+the stated crash-fault model: the shard remains durable and available through
+one replica crash (subject to quorum placement), not through arbitrary
+Byzantine or correlated storage failures.
+
+The owned engine is a bounded ordered key/value LSM, not a general SQL or
+distributed transaction engine. Its raw layer provides one serialized writer,
+concurrent pinned readers, atomic synced batches, a segmented checksummed WAL,
+bounded mutable and immutable memtables, immutable checksummed SSTables, and a
+checksummed manifest. The first production format deliberately has only
+overlapping L0 files and non-overlapping range-partitioned L1 files. Additional
+levels, compression, mmap, direct I/O, range tombstones, remote SST reads, and
+adaptive filters require later evidence and format decisions.
+
+Physical engine LSNs are node-local recovery coordinates and never become
+distributed timestamps. The MVCC layer encodes the authoritative per-range
+Raft apply index in descending order after each canonical logical key. UUIDv7
+remains an opaque proposer-owned row version/ETag, while commit HLC remains
+cross-range barrier and CDC metadata. Raft metadata, transaction records,
+deduplication results, primary rows, and local index records may share one
+physical engine through separate canonical namespaces without sharing their
+logical visibility rules. Global indexes remain separate replicated ranges and
+therefore still require the transaction protocol; a local storage batch cannot
+claim cross-range atomicity.
+
+Every write batch is encoded completely before entering the WAL. The engine
+appends a length-bounded CRC32C frame, handles short writes, synchronizes the
+WAL, and only then publishes the batch to memtables and advances its visible
+LSN. Group commit may share one sync across complete independently framed
+batches, but it cannot merge their atomic boundaries. A restart may discard
+only an incomplete suffix of the final active WAL segment. A checksum failure,
+malformed complete frame, sequence gap, conflicting duplicate, or corruption
+anywhere before that incomplete suffix is fail-stop and must never be treated
+as a missing key.
+
+SST and manifest publication follows write-temp, file-sync, rename,
+directory-sync, manifest-publish, then visibility. Obsolete SSTs and WAL
+segments are deleted only after the manifest that supersedes them is durable
+and every reader, backup, reshard, and restore pin has released them. Recovery
+loads the one checksummed manifest selected by the durable current pointer,
+validates referenced immutable files, and replays only WAL batches beyond its
+flushed LSN. All engine file access is rooted beneath one owner-only shard data
+directory; one process holds its exclusive ownership lock.
 
 The future storage-record contract is checksummed records with recovery
-validation before serving. A failed or lying sync, ENOSPC, or other durability
-uncertainty is fail-stop: the node must not acknowledge or serve data whose
-durability is unproven, and recovery must validate record checksums and
-boundaries before reopening service. This is a design requirement only; no
-storage engine, checksum format, or fault-handling path is implemented in
-Milestone 1.
+validation before serving. A successful sync is trusted only when the local
+engine reports completion on qualified stable storage. A reported sync
+failure, short write that cannot be completed, ENOSPC, I/O error, or detected
+recovery checksum/boundary corruption is terminal for that engine instance:
+the node must not acknowledge or serve data whose durability is unproven. The
+design does not claim to detect a storage device that lies about successful
+fsync; no such local detection mechanism exists, so protection comes from
+independent RF3 replicas, scrubbing, and failover to an intact quorum. This is
+a design requirement only; no storage engine, file format, or fault-handling
+path is implemented in Milestone 1.
 
 The clock contract is explicit: `Clock.Now` readings used for elapsed-time
 logic are monotonic within a process, while persisted HLC/deadline values are
@@ -26,9 +72,13 @@ encoded scalar fields, never hidden Go monotonic metadata. Manual clocks obey
 the same nondecreasing/equality contract deterministically; Real clocks retain
 the platform wall-clock failure behavior and require the replicated time
 authority for deadline decisions. The Go module pins synchronous timer-channel
-semantics with `godebug asynctimerchan=0`, so Real/manual timer parity is the
-default contract; an operator who overrides `GODEBUG` accepts the standard
-library's alternate timer behavior and any resulting parity difference.
+semantics with `godebug asynctimerchan=0`, so Real timer channels are
+zero-capacity by default; an operator who overrides `GODEBUG` accepts the
+standard library's alternate channel behavior. Manual timer channels are
+one-element buffered so deterministic `Advance` can deliver without a
+goroutine. Channel capacity is therefore not a cross-clock contract; callers
+must use `C`, `Stop`, and `Reset`. Tests can call `Manual.Prune` at teardown to
+release intentionally abandoned timers.
 
 Default GET reads are linearizable when offloaded. After request invocation,
 the gateway obtains a shard-leader `ReadIndex` (or an equivalent valid
@@ -55,11 +105,23 @@ invariant; otherwise the implementation must use `ReadIndex`. Additional
 non-voting read replicas may offload reads and background work but never count
 toward durability.
 
+The freshness fence also covers unresolved prepare records. A read at snapshot
+T must wait for the replicated decision, or return retryable 503, whenever an
+unresolved prepare has an earliest possible commit timestamp at or before T.
+It may skip that prepare only with durable evidence that its commit (if any)
+is strictly after T. A follower cannot satisfy the fence from a local
+apply-time guess; it must have the matching range generation, applied index,
+and prepare-resolution evidence after recovery or leader change.
+
 The cache layers are bounded gateway row caches, replica decoded/index caches,
-and Pebble block caches. Every strong cache hit carries a matching range
+the engine's immutable metadata/data-block caches, the operating-system page
+cache, and local storage. Every strong cache hit carries a matching range
 generation plus applied-index or HLC freshness fence; CDC invalidation is only
 an optimization and never the correctness proof. Transaction-private staged
-data never enters a shared cache tier. QUERY responses remain `no-store`.
+data never enters a shared cache tier. Engine cache keys include immutable file
+identity and block offset, and a block is checksummed before admission. Cache
+miss or eviction may change latency only, never visibility. QUERY responses
+remain `no-store`.
 
 CDC closed frontiers are durable replicated state, not process-local counters.
 A restart or leader change must recover the last durably validated per-range
@@ -98,15 +160,10 @@ restores into a new isolated cluster and replays only committed logical
 transactions. The journal cannot be deleted before the maximum of CDC, PITR,
 and active-backup retention dependencies.
 
-Base and incremental backups use immutable checksummed manifests and objects.
-Each backup takes one global barrier; an incremental names its parent and
-captures changed shard objects plus the required log interval. Restore runs in
-an isolated cluster and replays committed transactions only. CDC, PITR, and
-active-backup retention dependencies jointly constrain log deletion. The Go
-operator later owns CRDs and reconciliation for placement, backups/restores,
-resharding, and autoscaling, but it never guesses data-plane authority; status
-must reflect fenced catalog/Raft evidence. None of these mechanisms is
-implemented in Milestone 1.
+The Go operator later owns CRDs and reconciliation for placement,
+backups/restores, resharding, and autoscaling, but it never guesses data-plane
+authority; status must reflect fenced catalog/Raft evidence. None of these
+mechanisms is implemented in Milestone 1.
 
 Transaction deadlines use a replicated/quorum-derived monotonic HLC authority,
 not an individual node's wall clock. A deadline makes a transaction eligible
@@ -130,7 +187,7 @@ here.
 
 ## Not implemented in Milestone 1
 
-There is no Pebble database, Raft group, HTTP server, metadata catalog,
+There is no custom storage engine, Raft group, HTTP server, metadata catalog,
 follower-read path, split/merge controller, autoscaler, CDC journal, backup,
-or restore path yet. The `cmd` binaries intentionally stop before claiming
-any of these behaviors.
+or restore path yet. The `cmd` binaries intentionally stop before claiming any
+of these behaviors.

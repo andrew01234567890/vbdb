@@ -27,7 +27,7 @@ public-check-selftest:
 	./scripts/public-check-selftest.sh
 
 diff-check:
-	git diff --check
+	./scripts/diff-check-local.sh
 
 diff-check-ci:
 	./scripts/diff-check-ci.sh
@@ -38,4 +38,4 @@ diff-check-selftest:
 check: fmt-check fmt-check-selftest vet test race public-check public-check-selftest diff-check-selftest diff-check
 
 clean:
-	rm -rf bin coverage.out
+	rm -rf -- bin coverage.out

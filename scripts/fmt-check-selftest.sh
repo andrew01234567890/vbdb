@@ -2,8 +2,9 @@
 # Exercise fmt-check from outside its repository and prove fail-closed empty
 # repository behavior. Fixtures are disposable and live outside the checkout.
 set -euo pipefail
+export LC_ALL=C
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 tmp_base=${TMPDIR:-/tmp}
 case "$tmp_base" in
 	/*) ;;
