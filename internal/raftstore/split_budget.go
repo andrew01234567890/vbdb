@@ -67,11 +67,11 @@ func splitSnapshotMemory(snapshot SplitSnapshot) (int, error) {
 func splitDeltaMemory(delta SplitDelta) (int, error) {
 	command, err := EncodeCommand(delta.Command)
 	if err != nil {
-		return 0, err
+		return 0, ErrSplitChecksum
 	}
 	result, err := encodeResult(delta.Result)
 	if err != nil {
-		return 0, err
+		return 0, ErrSplitChecksum
 	}
 	return splitMemorySum(128, len(delta.SourceRangeID), len(delta.SourceStart), len(delta.SourceEnd), len(delta.SourceVoters)*8, len(command), len(result))
 }
