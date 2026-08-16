@@ -260,6 +260,11 @@ func (h *SplitHarness) WriteAtLeader(command Command, leaderID, term, ownerEpoch
 func (h *SplitHarness) WriteAtOwner(command Command, rangeID string, generation, ownerEpoch uint64, groupID ...uint64) (Result, error) {
 	h.mu.Lock()
 	group := h.source.GroupID
+	sourceID := h.source.RangeID
+	leftID, rightID := "", ""
+	if h.operation != nil {
+		leftID, rightID = h.operation.left.RangeID, h.operation.right.RangeID
+	}
 	if len(groupID) == 1 {
 		group = groupID[0]
 	}
@@ -268,7 +273,7 @@ func (h *SplitHarness) WriteAtOwner(command Command, rangeID string, generation,
 	if err != nil {
 		return Result{}, err
 	}
-	if descriptor.RangeID != h.source.RangeID {
+	if descriptor.RangeID != sourceID && descriptor.RangeID != leftID && descriptor.RangeID != rightID {
 		return Result{}, ErrRangeMoved
 	}
 	return h.Write(command)
