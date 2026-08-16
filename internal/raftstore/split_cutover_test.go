@@ -41,6 +41,13 @@ func TestSplitCutoverPublishesChildrenAndRetiresSourceOnce(t *testing.T) {
 	if err != nil || row.Sequence != 1 {
 		t.Fatalf("child read after cutover failed: %#v %v", row, err)
 	}
+	left, err := catalog.Route([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.WriteAtOwner(transferCommand(t, "a", `{"v":3}`), left.RangeID, left.Generation, left.OwnerEpoch, left.GroupID); err != nil {
+		t.Fatalf("current child route rejected: %v", err)
+	}
 }
 
 func TestSplitCutoverLeavesSourceServingWhenFinalBarrierFails(t *testing.T) {
