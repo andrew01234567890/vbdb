@@ -1,10 +1,11 @@
 # VBDB
 
 VBDB is a Go distributed document database under active construction. This
-branch is Milestone 1: it establishes the executable, encoding, deterministic
-test, and architecture contracts. It does not serve HTTP or persist rows yet.
-The binaries fail explicitly when a not-yet-implemented role is requested;
-they do not claim to be a usable database.
+branch is Milestone 2: it provides a runnable, explicitly development-only
+single-node HTTP database with durable JSON documents, UUIDv7 ETags, local
+MVCC history, and optimistic concurrency control. It is not a distributed
+database: there is no Raft, replication, transaction coordinator, query
+engine, indexes, CDC, or multi-process safety yet.
 
 ## Requirements
 
@@ -45,10 +46,35 @@ go run ./cmd/vbdbd --version
 go run ./cmd/vbdb-operator --version
 ```
 
-`vbdbd` accepts the future role contract (`gateway`, `metadata`, or `storage`)
-but exits with a clear not-implemented error until the corresponding milestone
-lands. `vbdb-operator` is intentionally dependency-free until its operator
-milestone.
+Run the standalone development gateway with a temporary data directory:
+
+```sh
+data_dir=$(mktemp -d)
+go run ./cmd/vbdbd --role=gateway --data-dir="$data_dir" --listen=127.0.0.1:8080
+```
+
+In another terminal, PUT and GET a document (the key is one URL segment):
+
+```sh
+curl -i -X PUT -H 'Content-Type: application/json' \
+  --data '{"name":"Ada","active":true}' http://127.0.0.1:8080/users/ada
+curl -i http://127.0.0.1:8080/users/ada
+```
+
+The response envelope is `{ "_key": "...", "_version": "<UUIDv7>",
+"value": <document> }`; the version is also a strong quoted `ETag`. Use
+`If-Match: "<etag>"` for replacement OCC or `If-None-Match: *` for
+create-only. A `GET` accepts `If-None-Match: "<etag>"` and `*`.
+
+PUT enforces the 1 MiB limit both on the received JSON request and on its
+canonical JSON representation after validation; this bounds the durable row
+as well as the request body.
+
+`vbdbd --role=metadata` and `--role=storage` fail explicitly as not
+implemented. `X-Transaction-Id`, transactions, QUERY, admin, and CDC are
+explicit later-milestone boundaries. The data directory is owned by VBDB's
+custom engine; do not run two processes against it. Stop the process and
+restart it with the same directory to exercise synced close/reopen recovery.
 
 ## Packages
 
@@ -60,10 +86,17 @@ milestone.
 - `pkg/clock`: injectable real and concurrency-safe manual clocks/timers.
 - `pkg/failpoint`: explicitly injected, disabled-by-default named failpoints;
   no global production hook exists.
+- `pkg/uuidv7`: RFC 9562 UUIDv7 generation/parsing with injectable clock and
+  random reader.
+- `internal/engine`: VBDB's owned ordered key/value durability engine.
+- `internal/storage`: MVCC row versions and current-head semantics over that
+  engine.
+- `internal/httpapi`: direct-testable GET/PUT HTTP contract for the gateway.
 
 The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
-milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.md).
+current milestone acceptance checklist is [`docs/milestones/m2.md`](docs/milestones/m2.md);
+the Milestone 1 checklist remains as historical context.
 
 `make public-check` is an optional local scan. It scans every commit reachable from local refs (plus a
 detached `HEAD`), raw commit and annotated-tag objects/ref names, stage-zero
