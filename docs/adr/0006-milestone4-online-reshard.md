@@ -20,3 +20,14 @@ publication, ReadIndex serving, split transfer, and cutover are supplied by
 the higher stacked slices. M4 remains a deterministic in-process proof; it
 does not claim production routing RPC, independent child Raft lifecycle, or
 automatic reshard policy.
+
+## Durable catalog boundary
+
+The catalog is persisted as one complete canonical value under the owned
+engine's `m4/catalog/complete` key. The value is synced before the in-memory
+pointer is replaced. Restart accepts only a complete, checksummed image and
+cross-checks every current descriptor's exact RF3 voters with the durable
+local Raft `ConfState`. A sync failure is fatal and cannot expose a partial
+route. Removed range IDs remain retired tombstones, so a higher catalog
+version cannot resurrect an old owner. This is a local durable metadata hook;
+it is not a production catalog replication protocol.
