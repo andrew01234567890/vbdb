@@ -57,3 +57,29 @@ all waiters wake on apply, cancellation, close, fatal storage failure, or
 ReadIndex failure. This implementation is an in-process M4 proof over the M3
 Raft transport; it does not claim production routing RPC, cache invalidation,
 or automatic retry policy.
+
+## Non-serving split transfer proof
+
+The transfer layer models one source range and two child projections. It takes
+the source's durable logical applied index as the barrier and binds the
+snapshot manifest to the complete source descriptor, owner epoch, row bounds,
+and CRC32C-protected canonical image. A matching healthy non-leader voter is
+preferred as the copy source; leader fallback is available only as an
+explicit deterministic-harness option. The source remains the sole serving
+authority throughout this slice.
+
+Snapshot bytes move through bounded `VBCP` chunks. Receivers validate magic,
+version, count, index, lengths, reordering, exact duplicate equality, and the
+complete checksum before exposing rows. Every post-barrier delta carries the
+source span, immutable ID, generation, owner epoch, group, voters, phase, and
+configuration fingerprint, together with canonical command/result identity.
+The retained suffix is bounded by both count and bytes; missing or conflicting
+sequences fail closed.
+
+Catch-up sorts a copied suffix and requires strict contiguous source sequence.
+It validates and applies the complete projected left/right images before one
+swap, so a late malformed delta leaves the live child images unchanged. The
+target proof requires both children to remain `CATCHING_UP`, exact adjacent
+spans, matching RF3 membership, matching durable `ConfState`, and a quorum
+acknowledgement. This branch does not publish child routes or claim a cutover;
+that is one later durable catalog replacement.
