@@ -83,3 +83,30 @@ target proof requires both children to remain `CATCHING_UP`, exact adjacent
 spans, matching RF3 membership, matching durable `ConfState`, and a quorum
 acknowledgement. This branch does not publish child routes or claim a cutover;
 that is one later durable catalog replacement.
+
+## Fenced cutover, retry identity, and recovery boundary
+
+Cutover rechecks the final source barrier and both complete child projections
+under one operation lock. It constructs adjacent `SERVING` child
+descriptors, advances their generation and owner epoch, and replaces the
+single source descriptor with both children in one complete catalog image.
+The source remains a retired tombstone in catalog history. A failed final
+barrier, target proof, or catalog replacement leaves the source route intact;
+there is no one-child or dual-owner intermediate image. Repeating a completed
+cutover is idempotent.
+
+An operation retry freezes `OperationID`, canonical command bytes, and the
+candidate UUIDv7 row version at the first attempt. Equal identity returns the
+same durable result; a different command, condition, or candidate version is
+`ErrOperationConflict` with no mutation. Stale source routes return
+`ErrRangeMoved`, and response loss is resolved by durable identity lookup or
+replaying the same frozen command. A retry never mints a replacement version.
+
+Recovery accepts only a complete generation marker containing a non-zero
+barrier, snapshot checksum, catalog version, source fence, and digest.
+Incomplete staging is non-serving and may be resent from its validated
+manifest. This marker is deliberately not an in-flight replicated coordinator
+journal: M4 does not claim to resume a process-local split coordinator after a
+crash. Catalog restart continues to use the complete-image and exact
+`ConfState` checks above, so uncertain publication cannot invent a hybrid
+route.
