@@ -39,7 +39,11 @@ anti-reuse evidence or a verifiable generation/expiry fence for that identity;
 recovery must restore that evidence or fence before the replica serves writes.
 Retired, expired, or indeterminate identities are rejected without mutation,
 and exhaustion or uncertainty in anti-reuse admission fails closed rather than
-turning the identity into a fresh blind PUT.
+turning the identity into a fresh blind PUT. Full results also have configured
+count and encoded-byte limits at principal/tenant/route/target/range and
+cluster scopes; projected capacity is reserved atomically before a new
+identity can mutate or be acknowledged. If neither result capacity nor safe
+anti-reuse evidence/fence can be reserved, admission fails closed.
 
 Every write batch is encoded completely before entering the WAL. The engine
 appends a length-bounded CRC32C frame, handles short writes, synchronizes the

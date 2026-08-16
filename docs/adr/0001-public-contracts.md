@@ -92,7 +92,13 @@ the evidence/fence cannot be durably established, GC or new admission fails
 closed without acknowledging a mutation. Recovery must restore the evidence
 or fence before accepting writes. Identity reuse is permitted only after a
 durable fence proves that the old identity is safely outside the retry
-ambiguity window.
+ambiguity window. The full-result population is also bounded by configured
+count and encoded-byte limits at each authenticated principal/tenant/route/
+target/range scope and by cluster-wide aggregate limits. Every fresh identity
+reserves its projected result count and bytes atomically before the row
+mutation or acknowledgement; if neither a full result slot/byte budget nor
+safe anti-reuse evidence or a generation fence can be reserved, the request is
+rejected without changing durable state.
 
 Every request carrying `X-Transaction-Id` requires the response to include
 `Cache-Control: no-store, private` and `Vary: X-Transaction-Id`, including
