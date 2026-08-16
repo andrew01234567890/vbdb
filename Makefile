@@ -1,4 +1,4 @@
-.PHONY: all fmt fmt-check fmt-check-selftest vet test race public-check public-check-selftest diff-check diff-check-ci diff-check-selftest check clean
+.PHONY: all fmt fmt-check fmt-check-selftest vet test race diff-check diff-check-ci diff-check-selftest check clean
 
 all: check
 
@@ -19,12 +19,6 @@ test:
 
 race:
 	go test -race ./...
-
-public-check:
-	./scripts/public-check.sh
-
-public-check-selftest:
-	./scripts/public-check-selftest.sh
 
 diff-check:
 	./scripts/diff-check-local.sh

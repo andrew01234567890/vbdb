@@ -29,12 +29,11 @@ self-test, vet, unit tests, and race tests. GitHub Actions runs the same Go
 quality/testing checks only. It intentionally does not run repository
 publication-safety or committed-diff scans.
 
-Optional local publication-safety and diff checks are available when preparing
-a commit or stack submission:
+Publication-safety review follows the private handover policy and is not
+exposed as a public Make target. The standalone diff checks remain available
+when preparing a commit or stack submission:
 
 ```sh
-make public-check
-make public-check-selftest
 make diff-check
 make diff-check-selftest
 make diff-check-ci
@@ -169,8 +168,10 @@ The public and internal architecture contracts are in
 current milestone acceptance checklist is [`docs/milestones/m3.md`](docs/milestones/m3.md);
 the Milestone 1 checklist remains as historical context.
 
-`make public-check` is an optional local scan. It scans every commit reachable from local refs (plus a
-detached `HEAD`), raw commit and annotated-tag objects/ref names, stage-zero
+The standalone `scripts/public-check.sh` scanner remains available to the
+private handover workflow; it is not exposed as a Make target. It scans every
+commit reachable from local refs (plus a detached `HEAD`), raw commit and
+annotated-tag objects/ref names, stage-zero
 index blobs, and current tracked/non-ignored intended files for high-risk
 artifact names (including kubeconfig, `.kube`/`.docker` trees, `.netrc`,
 `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.htpasswd`, `.dockercfg`,
@@ -180,8 +181,9 @@ harmless fixtures under risky names are rejected too, with no unsafe
 suppression mechanism; use explicitly safe example names. It reports safe
 source identities and categories only; credential-shaped, high-risk, or
 unsafe paths are digested and matching contents are never printed. It rejects
-shallow history, grafts, gitlinks, and repository-selection overrides. `make
-public-check-selftest` exercises binary data, ref/history/index/worktree path
+shallow history, grafts, gitlinks, and repository-selection overrides. The
+standalone `scripts/public-check-selftest.sh` exercises binary data,
+ref/history/index/worktree path
 coverage, commit/tag metadata, replacement-object and graft immunity, shallow
 history rejection, gitlink rejection, hostile environment redirection, and
 fail-closed enumeration. All fixtures are created outside the repository in a
