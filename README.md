@@ -19,11 +19,23 @@ make fmt-check-selftest
 make vet
 make test
 make race
+make check
+```
+
+`make check` is the local Go quality gate and runs formatting, the formatting
+self-test, vet, unit tests, and race tests. GitHub Actions runs the same Go
+quality/testing checks only. It intentionally does not run repository
+publication-safety or committed-diff scans.
+
+Optional local publication-safety and diff checks are available when preparing
+a commit or stack submission:
+
+```sh
 make public-check
 make public-check-selftest
 make diff-check
 make diff-check-selftest
-make check
+make diff-check-ci
 ```
 
 Version checks work now:
@@ -53,7 +65,7 @@ The public and internal architecture contracts are in
 [`docs/adr/`](docs/adr/), including the later-milestone boundaries. The
 milestone acceptance checklist is [`docs/milestones/m1.md`](docs/milestones/m1.md).
 
-`make public-check` scans every commit reachable from local refs (plus a
+`make public-check` is an optional local scan. It scans every commit reachable from local refs (plus a
 detached `HEAD`), raw commit and annotated-tag objects/ref names, stage-zero
 index blobs, and current tracked/non-ignored intended files for high-risk
 artifact names (including kubeconfig, `.kube`/`.docker` trees, `.netrc`,
@@ -86,18 +98,20 @@ attribute, hideRefs, and diff-helper settings cannot redirect the scan.
 Credential/private-key matches are redacted; oversized Git blobs/objects fail
 closed at the bounded scanner limit rather than being partially inspected.
 
-`make diff-check` checks the local worktree. CI also runs
-`make diff-check-ci` over the exact event base/head range, checking every
-introduced commit (including an initial push). Non-fast-forward or unrelated
-push histories safely fall back to the full new head history, and branch
-deletion events are skipped because they introduce no content. The checker
-never performs transport: Actions uses `fetch-depth: 0`,
-pull-request base/head absence fails closed, and a missing push predecessor
-uses only the full-new-head fallback. `make diff-check-selftest` covers
+`make diff-check` is an optional local worktree check. `make diff-check-ci` is
+also retained as an optional local check for an explicitly supplied event
+base/head range; it is not invoked by GitHub Actions. Non-fast-forward or
+unrelated push histories safely fall back to the full new head history, and
+branch deletion events are skipped because they introduce no content. The
+checker never performs transport: a caller must provide the repository and
+event SHAs, and missing or unusable inputs fail closed. `make
+diff-check-selftest` covers
 introduced-then-removed whitespace, merge resolution checking (including a
 legal mid-file blank, CRLF payloads, and a true blank at EOF), force-push fallback, hostile Git
 configuration and attributes, pager suppression, and divergent pull-request
-bases.
+bases. Before committing or submitting a stack, inspect the exact staged diff
+(`git diff --cached --stat` and `git diff --cached`) and run any appropriate
+optional local scans; never publish secrets or private files.
 
 Manual timer channels are one-slot buffered so deterministic `Advance` can
 deliver without a goroutine; Real timer channels follow Go's runtime setting

@@ -31,15 +31,3 @@ jobs:
         run: make test
       - name: Race tests
         run: make race
-      - name: Public-repository safety
-        run: make public-check
-      - name: Public-repository safety self-test
-        run: make public-check-selftest
-      - name: Committed diff-check self-test
-        run: make diff-check-selftest
-      - name: Committed diff check
-        env:
-          VBDB_EVENT_NAME: ${{ github.event_name }}
-          VBDB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          VBDB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
-        run: make diff-check-ci

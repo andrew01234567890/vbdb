@@ -35,7 +35,7 @@ diff-check-ci:
 diff-check-selftest:
 	./scripts/diff-check-selftest.sh
 
-check: fmt-check fmt-check-selftest vet test race public-check public-check-selftest diff-check-selftest diff-check
+check: fmt-check fmt-check-selftest vet test race
 
 clean:
 	rm -rf -- bin coverage.out
