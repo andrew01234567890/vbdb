@@ -31,3 +31,29 @@ local Raft `ConfState`. A sync failure is fatal and cannot expose a partial
 route. Removed range IDs remain retired tombstones, so a higher catalog
 version cannot resurrect an old owner. This is a local durable metadata hook;
 it is not a production catalog replication protocol.
+
+## Follower-read linearization
+
+`ReadIndex` is the only serving read path for a routed replica. The request
+first captures a defensive copy of the serving descriptor and catalog version,
+then registers a bounded request context before asking local Raft for a quorum
+ReadIndex. Contexts contain a per-open, durably rotated boot nonce, a
+monotonic sequence, and a CRC32C; cancellation retires the exact context so a
+delayed response cannot satisfy a later request. The Ready loop copies and
+correlates each `ReadState` only after the Ready's durable persistence and
+logical apply work. Malformed or unknown contexts fail the replica closed.
+
+The returned index is a logical applied-index fence. The replica waits until
+its durable state machine has applied at least that index, reads under the
+state lock, and then reacquires the catalog lock. It compares the complete
+descriptor (span, range ID, generation, owner epoch, group, voters, phase) and
+catalog version with the captured copy before returning the row. Any route
+movement discards the copied row and returns `ErrRangeMoved`; a locally present
+but stale row is never a successful fallback. Engine LSNs and local row
+sequence values are not read freshness evidence.
+
+Pending contexts are bounded by both count and retained coordinate bytes, and
+all waiters wake on apply, cancellation, close, fatal storage failure, or
+ReadIndex failure. This implementation is an in-process M4 proof over the M3
+Raft transport; it does not claim production routing RPC, cache invalidation,
+or automatic retry policy.
