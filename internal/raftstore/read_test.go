@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -95,5 +96,36 @@ func TestReadFinishWakesPendingWaiters(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("pending waiter was not woken")
+	}
+}
+
+func TestReadRouteFreshnessRejectsCatalogMovement(t *testing.T) {
+	descriptor := testReadDescriptor()
+	catalog, err := NewRangeCatalog(1, []RangeDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Replica{rangeCatalog: catalog}
+	if err := r.validateReadRoute("alice", descriptor, 1); err != nil {
+		t.Fatalf("matching route rejected: %v", err)
+	}
+	moved := descriptor.Clone()
+	moved.Generation++
+	if err := catalog.Replace(2, []RangeDescriptor{moved}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.validateReadRoute("alice", descriptor, 1); !errors.Is(err, ErrRangeMoved) {
+		t.Fatalf("catalog movement returned %v", err)
+	}
+}
+
+func TestWaitAppliedAtLeastUsesLogicalAppliedIndex(t *testing.T) {
+	r := &Replica{state: newLogicalState(), appliedCh: make(chan struct{})}
+	r.state.lastApplied = 7
+	if err := r.WaitAppliedAtLeast(nil, 7); err == nil {
+		t.Fatal("nil context unexpectedly accepted")
+	}
+	if err := r.WaitAppliedAtLeast(context.Background(), 7); err != nil {
+		t.Fatalf("applied logical index rejected: %v", err)
 	}
 }
