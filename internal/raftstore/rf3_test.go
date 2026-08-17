@@ -121,6 +121,7 @@ const (
 	maxRF3ConditionWait      = 5 * time.Second
 	maxRF3QuiescenceMessages = 512
 	maxRF3QuiescenceWait     = time.Second
+	maxRF3ReadyPollWait      = 10 * time.Millisecond
 )
 
 func newRF3Transport() *rf3Transport {
@@ -197,8 +198,26 @@ func (t *rf3Transport) readyCounts(nodes []*Replica) map[uint64]int {
 	return counts
 }
 
-func (t *rf3Transport) waitAnyReady(ctx context.Context, nodes []*Replica, before map[uint64]int) error {
+// waitAnyReadyBounded observes Ready progress opportunistically, but never
+// turns a silent Tick into a wait until the phase deadline. The caller's
+// condition is checked while waiting, and the short polling timer bounds how
+// long a phase waits before issuing another logical Tick.
+func (t *rf3Transport) waitAnyReadyBounded(ctx context.Context, nodes []*Replica, before map[uint64]int, condition func() bool) bool {
+	wait := maxRF3ReadyPollWait
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+	}
+	if wait <= 0 {
+		return condition()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	for {
+		if condition() {
+			return true
+		}
 		t.mu.Lock()
 		ready := false
 		for _, node := range nodes {
@@ -210,12 +229,15 @@ func (t *rf3Transport) waitAnyReady(ctx context.Context, nodes []*Replica, befor
 		notice := t.readyNotice
 		t.mu.Unlock()
 		if ready {
-			return nil
+			return condition()
 		}
 		select {
 		case <-notice:
+			continue
+		case <-timer.C:
+			return condition()
 		case <-ctx.Done():
-			return ctx.Err()
+			return condition()
 		}
 	}
 }
@@ -267,11 +289,11 @@ func (t *rf3Transport) setPartition(a, b uint64, blocked bool) {
 	t.blocked[[2]uint64{b, a}] = blocked
 }
 
-func (t *rf3Transport) deliverOne(ctx context.Context, index int) bool {
+func (t *rf3Transport) deliverOne(ctx context.Context, index int) (bool, error) {
 	t.mu.Lock()
 	if len(t.queue) == 0 {
 		t.mu.Unlock()
-		return false
+		return false, nil
 	}
 	if index < 0 || index >= len(t.queue) {
 		if t.reverse {
@@ -290,14 +312,18 @@ func (t *rf3Transport) deliverOne(ctx context.Context, index int) bool {
 	peer := t.nodes[envelope.to]
 	t.mu.Unlock()
 	if blocked || peer == nil {
-		return true
+		return true, nil
 	}
 	beforeReady := t.readyCount(peer.id)
-	_ = peer.Step(context.Background(), envelope.message)
-	if rf3MessageProducesReady(envelope.message.GetType()) {
-		_ = t.waitReady(ctx, peer.id, beforeReady)
+	if err := peer.Step(ctx, envelope.message); err != nil {
+		return true, fmt.Errorf("rf3: deliver %d -> %d %s: %w", envelope.from, envelope.to, envelope.message.GetType(), err)
 	}
-	return true
+	if rf3MessageProducesReady(envelope.message.GetType()) {
+		if err := t.waitReady(ctx, peer.id, beforeReady); err != nil {
+			return true, fmt.Errorf("rf3: wait for Ready after delivering %d -> %d %s: %w", envelope.from, envelope.to, envelope.message.GetType(), err)
+		}
+	}
+	return true, nil
 }
 
 // quiesce drains all currently available transport work and yields between
@@ -311,7 +337,11 @@ func (t *rf3Transport) quiesce(ctx context.Context, nodes []*Replica) error {
 			return ctx.Err()
 		default:
 		}
-		if t.deliverOne(ctx, -1) {
+		delivered, err := t.deliverOne(ctx, -1)
+		if err != nil {
+			return err
+		}
+		if delivered {
 			runtime.Gosched()
 			continue
 		}
@@ -319,7 +349,11 @@ func (t *rf3Transport) quiesce(ctx context.Context, nodes []*Replica) error {
 		// scheduler handoff, then confirm the queue is still empty before
 		// declaring this drive quiescent.
 		runtime.Gosched()
-		if t.deliverOne(ctx, -1) {
+		delivered, err = t.deliverOne(ctx, -1)
+		if err != nil {
+			return err
+		}
+		if delivered {
 			runtime.Gosched()
 			continue
 		}
@@ -336,6 +370,10 @@ func (t *rf3Transport) quiesce(ctx context.Context, nodes []*Replica) error {
 func (t *rf3Transport) drive(ctx context.Context, nodes ...*Replica) error {
 	for _, node := range nodes {
 		node.Tick()
+		// Status completes a round trip through the raft node, preventing a
+		// silent tick from being outrun by an unbounded loop of logical ticks.
+		// It does not require that every tick emit a Ready.
+		_ = node.Status()
 	}
 	return t.quiesce(ctx, nodes)
 }
@@ -369,6 +407,10 @@ func (t *rf3Transport) driveUntil(tb testing.TB, label string, timeout time.Dura
 	t.driveUntilMode(tb, label, timeout, nodes, false, condition)
 }
 
+// driveUntilReady keeps the historical name for phases that drive a node
+// clock, but a Tick is allowed to produce no Ready. Recheck the substantive
+// condition after every bounded drive instead of waiting for one Ready for
+// the entire remaining deadline.
 func (t *rf3Transport) driveUntilReady(tb testing.TB, label string, timeout time.Duration, nodes []*Replica, condition func() bool) {
 	t.driveUntilMode(tb, label, timeout, nodes, true, condition)
 }
@@ -395,10 +437,10 @@ func (t *rf3Transport) driveUntilMode(tb testing.TB, label string, timeout time.
 		}
 		if awaitReady {
 			ctx, cancel = context.WithTimeout(context.Background(), time.Until(deadline))
-			err = t.waitAnyReady(ctx, nodes, beforeReady)
+			done := t.waitAnyReadyBounded(ctx, nodes, beforeReady, condition)
 			cancel()
-			if err != nil {
-				tb.Fatalf("RF3 %s Ready completion failed at drive %d: %v (%s)", label, drives, err, t.diagnostics(nodes))
+			if done {
+				return
 			}
 		}
 		runtime.Gosched()
@@ -463,6 +505,14 @@ func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	leaderBeforePartition := nodes[0].Status()
+	if leaderBeforePartition.Leader != 1 {
+		t.Fatalf("RF3 proposal leader = %#v, want node 1", leaderBeforePartition)
+	}
+	// Isolate one follower while the other follower remains connected, so the
+	// proposal commits on a quorum without pre-populating node 2's result.
+	transport.setPartition(1, 2, true)
+	partitionStart := transport.blockedCount(1, 2)
 	transport.reverse = true
 	resultCh := make(chan error, 1)
 	go func() { _, err := nodes[0].Propose(context.Background(), command); resultCh <- err }()
@@ -478,14 +528,19 @@ func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	if proposalErr != nil {
 		t.Fatal(proposalErr)
 	}
-	transport.setPartition(1, 2, true)
-	transport.setPartition(1, 3, true)
-	partitionStart := transport.partitionTrafficCount()
-	transport.driveUntil(t, "partition", maxRF3ConditionWait, nodes[1:], func() bool {
-		return transport.partitionTrafficCount() > partitionStart
+	transport.driveUntil(t, "partition", maxRF3ConditionWait, nodes[:1], func() bool {
+		return transport.blockedCount(1, 2) > partitionStart
 	})
+	if _, ok, err := nodes[1].LookupResult(command.OperationID); err != nil {
+		t.Fatalf("RF3 partitioned follower lookup = %v", err)
+	} else if ok {
+		t.Fatal("RF3 partitioned follower already has the committed result")
+	}
+	leaderDuringPartition := nodes[0].Status()
+	if leaderDuringPartition.Leader != leaderBeforePartition.Leader || leaderDuringPartition.Term != leaderBeforePartition.Term {
+		t.Fatalf("RF3 leader changed during partition: before=%#v during=%#v", leaderBeforePartition, leaderDuringPartition)
+	}
 	transport.setPartition(1, 2, false)
-	transport.setPartition(1, 3, false)
 	var retry Result
 	var retryOK bool
 	var retryErr error
@@ -498,6 +553,10 @@ func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	}
 	if retry.Command.OperationID != command.OperationID || retry.Command.Table != command.Table || retry.Command.Key != command.Key || !bytes.Equal(retry.Command.Value, command.Value) || retry.Command.Version != command.Version || !retry.Succeeded() {
 		t.Fatalf("follower retry result = %#v, want successful command %#v", retry, command)
+	}
+	leaderAfterHeal := nodes[0].Status()
+	if leaderAfterHeal.Leader != leaderBeforePartition.Leader || leaderAfterHeal.Term != leaderBeforePartition.Term {
+		t.Fatalf("RF3 leader changed after partition heal: before=%#v after=%#v", leaderBeforePartition, leaderAfterHeal)
 	}
 	transport.reverse = false
 }
