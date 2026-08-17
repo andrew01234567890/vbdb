@@ -54,6 +54,10 @@ type Options struct {
 	SyncFailure   func(string) error
 	ElectionTick  int
 	HeartbeatTick int
+	// readyHook is an internal test-harness completion signal. It runs only
+	// after a Ready has been persisted, applied, sent, and advanced; it does
+	// not participate in Raft state transitions.
+	readyHook func()
 }
 
 type Outcome uint8
@@ -103,6 +107,7 @@ type Replica struct {
 	transportCtx    context.Context
 	transportCancel context.CancelFunc
 	appliedCh       chan struct{}
+	readyHook       func()
 }
 
 type proposalDelivery struct {
@@ -219,7 +224,7 @@ func Open(options Options) (*Replica, error) {
 	}
 	config := &raft.Config{ID: options.ID, ElectionTick: options.ElectionTick, HeartbeatTick: options.HeartbeatTick, Storage: disk, Applied: disk.applied, MaxSizePerMsg: 1 << 20, MaxInflightMsgs: 128, MaxUncommittedEntriesSize: maxUncommittedEntriesSize, CheckQuorum: true, PreVote: true, StepDownOnRemoval: true, DisableProposalForwarding: true, AsyncStorageWrites: false}
 	transportCtx, transportCancel := context.WithCancel(context.Background())
-	r := &Replica{disk: disk, state: state, id: options.ID, transport: options.Transport, pending: make(map[uuidv7.UUID]*pendingProposal), done: make(chan struct{}), readyDone: make(chan struct{}), stopLoop: make(chan struct{}), transportCtx: transportCtx, transportCancel: transportCancel, appliedCh: make(chan struct{})}
+	r := &Replica{disk: disk, state: state, id: options.ID, transport: options.Transport, pending: make(map[uuidv7.UUID]*pendingProposal), done: make(chan struct{}), readyDone: make(chan struct{}), stopLoop: make(chan struct{}), transportCtx: transportCtx, transportCancel: transportCancel, appliedCh: make(chan struct{}), readyHook: options.readyHook}
 	if (fresh || incompleteBootstrap) && last == 0 {
 		r.node = raft.StartNode(config, options.Peers)
 	} else {
@@ -388,6 +393,9 @@ func (r *Replica) readyLoop() {
 		r.send(messages)
 		// Advance is deliberately after logical-state Sync and outbound copies.
 		r.node.Advance()
+		if r.readyHook != nil {
+			r.readyHook()
+		}
 	}
 }
 
