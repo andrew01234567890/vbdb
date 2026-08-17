@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -105,17 +107,126 @@ type rf3Envelope struct {
 // rf3Transport is deliberately deterministic: tests control delivery order
 // and link partitions without introducing a production transport claim.
 type rf3Transport struct {
-	mu      sync.Mutex
-	nodes   map[uint64]*Replica
-	queue   []*rf3Envelope
-	blocked map[[2]uint64]bool
-	reverse bool
+	mu           sync.Mutex
+	nodes        map[uint64]*Replica
+	queue        []*rf3Envelope
+	blocked      map[[2]uint64]bool
+	blockedSends map[[2]uint64]int
+	readyByNode  map[uint64]int
+	readyNotice  chan struct{}
+	reverse      bool
 }
 
-const maxRF3ElectionDrives = 128
+const (
+	maxRF3ConditionWait      = 5 * time.Second
+	maxRF3QuiescenceMessages = 512
+	maxRF3QuiescenceWait     = time.Second
+)
 
 func newRF3Transport() *rf3Transport {
-	return &rf3Transport{nodes: make(map[uint64]*Replica), blocked: make(map[[2]uint64]bool)}
+	return &rf3Transport{
+		nodes:        make(map[uint64]*Replica),
+		blocked:      make(map[[2]uint64]bool),
+		blockedSends: make(map[[2]uint64]int),
+		readyByNode:  make(map[uint64]int),
+		readyNotice:  make(chan struct{}),
+	}
+}
+
+func (t *rf3Transport) signalReady(id uint64) {
+	t.mu.Lock()
+	t.readyByNode[id]++
+	close(t.readyNotice)
+	t.readyNotice = make(chan struct{})
+	t.mu.Unlock()
+}
+
+func (t *rf3Transport) waitNodesReady(ctx context.Context, nodes []*Replica) error {
+	for {
+		t.mu.Lock()
+		ready := true
+		for _, node := range nodes {
+			if t.readyByNode[node.id] == 0 {
+				ready = false
+				break
+			}
+		}
+		notice := t.readyNotice
+		t.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-notice:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (t *rf3Transport) readyCount(id uint64) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.readyByNode[id]
+}
+
+func (t *rf3Transport) waitReady(ctx context.Context, id uint64, before int) error {
+	for {
+		t.mu.Lock()
+		after := t.readyByNode[id]
+		notice := t.readyNotice
+		t.mu.Unlock()
+		if after > before {
+			return nil
+		}
+		select {
+		case <-notice:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (t *rf3Transport) readyCounts(nodes []*Replica) map[uint64]int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	counts := make(map[uint64]int, len(nodes))
+	for _, node := range nodes {
+		counts[node.id] = t.readyByNode[node.id]
+	}
+	return counts
+}
+
+func (t *rf3Transport) waitAnyReady(ctx context.Context, nodes []*Replica, before map[uint64]int) error {
+	for {
+		t.mu.Lock()
+		ready := false
+		for _, node := range nodes {
+			if t.readyByNode[node.id] > before[node.id] {
+				ready = true
+				break
+			}
+		}
+		notice := t.readyNotice
+		t.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-notice:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func rf3MessageProducesReady(messageType pb.MessageType) bool {
+	switch messageType {
+	case pb.MsgApp, pb.MsgHeartbeat, pb.MsgVote, pb.MsgPreVote, pb.MsgReadIndex:
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *rf3Transport) Send(ctx context.Context, to uint64, message *pb.Message) error {
@@ -126,9 +237,12 @@ func (t *rf3Transport) Send(ctx context.Context, to uint64, message *pb.Message)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if !t.blocked[[2]uint64{message.GetFrom(), to}] {
-		t.queue = append(t.queue, &rf3Envelope{from: message.GetFrom(), to: to, message: proto.Clone(message).(*pb.Message)})
+	link := [2]uint64{message.GetFrom(), to}
+	if t.blocked[link] {
+		t.blockedSends[link]++
+		return nil
 	}
+	t.queue = append(t.queue, &rf3Envelope{from: message.GetFrom(), to: to, message: proto.Clone(message).(*pb.Message)})
 	return nil
 }
 
@@ -153,7 +267,7 @@ func (t *rf3Transport) setPartition(a, b uint64, blocked bool) {
 	t.blocked[[2]uint64{b, a}] = blocked
 }
 
-func (t *rf3Transport) deliverOne(index int) bool {
+func (t *rf3Transport) deliverOne(ctx context.Context, index int) bool {
 	t.mu.Lock()
 	if len(t.queue) == 0 {
 		t.mu.Unlock()
@@ -168,41 +282,143 @@ func (t *rf3Transport) deliverOne(index int) bool {
 	}
 	envelope := t.queue[index]
 	t.queue = append(t.queue[:index], t.queue[index+1:]...)
-	blocked := t.blocked[[2]uint64{envelope.from, envelope.to}]
+	link := [2]uint64{envelope.from, envelope.to}
+	blocked := t.blocked[link]
+	if blocked {
+		t.blockedSends[link]++
+	}
 	peer := t.nodes[envelope.to]
 	t.mu.Unlock()
 	if blocked || peer == nil {
 		return true
 	}
+	beforeReady := t.readyCount(peer.id)
 	_ = peer.Step(context.Background(), envelope.message)
+	if rf3MessageProducesReady(envelope.message.GetType()) {
+		_ = t.waitReady(ctx, peer.id, beforeReady)
+	}
 	return true
 }
 
-func (t *rf3Transport) drive(nodes ...*Replica) {
+// quiesce drains all currently available transport work and yields between
+// empty observations so an asynchronous Ready loop can publish its messages.
+// The bounded message budget is a safety limit, not a progress assumption; a
+// caller waits on a substantive condition in driveUntil.
+func (t *rf3Transport) quiesce(ctx context.Context, nodes []*Replica) error {
+	for message := 0; message < maxRF3QuiescenceMessages; message++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if t.deliverOne(ctx, -1) {
+			runtime.Gosched()
+			continue
+		}
+		// A Ready loop may be between persistence/apply and Send. Give it a
+		// scheduler handoff, then confirm the queue is still empty before
+		// declaring this drive quiescent.
+		runtime.Gosched()
+		if t.deliverOne(ctx, -1) {
+			runtime.Gosched()
+			continue
+		}
+		t.mu.Lock()
+		queued := len(t.queue)
+		t.mu.Unlock()
+		if queued == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("rf3: transport did not quiesce after %d messages (%s)", maxRF3QuiescenceMessages, t.diagnostics(nodes))
+}
+
+func (t *rf3Transport) drive(ctx context.Context, nodes ...*Replica) error {
 	for _, node := range nodes {
 		node.Tick()
 	}
-	time.Sleep(time.Millisecond)
-	for t.deliverOne(-1) {
-	}
+	return t.quiesce(ctx, nodes)
 }
 
-func (t *rf3Transport) driveUntil(tb testing.TB, maxDrives int, nodes []*Replica, condition func() bool) {
-	tb.Helper()
-	for drive := 0; drive < maxDrives; drive++ {
-		t.drive(nodes...)
-		if condition() {
-			return
-		}
-	}
+func (t *rf3Transport) diagnostics(nodes []*Replica) string {
 	t.mu.Lock()
 	queued := len(t.queue)
+	blocked := make(map[[2]uint64]int, len(t.blockedSends))
+	for link, count := range t.blockedSends {
+		blocked[link] = count
+	}
 	t.mu.Unlock()
 	statuses := make([]Diagnostic, len(nodes))
 	for i, node := range nodes {
 		statuses[i] = node.Status()
 	}
-	tb.Fatalf("condition not met after %d deterministic drives: statuses=%#v queued=%d", maxDrives, statuses, queued)
+	return fmt.Sprintf("statuses=%#v queued=%d blocked=%v", statuses, queued, blocked)
+}
+
+func (t *rf3Transport) blockedCount(from, to uint64) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.blockedSends[[2]uint64{from, to}]
+}
+
+func (t *rf3Transport) partitionTrafficCount() int {
+	return t.blockedCount(1, 2) + t.blockedCount(2, 1) + t.blockedCount(1, 3) + t.blockedCount(3, 1)
+}
+
+func (t *rf3Transport) driveUntil(tb testing.TB, label string, timeout time.Duration, nodes []*Replica, condition func() bool) {
+	t.driveUntilMode(tb, label, timeout, nodes, false, condition)
+}
+
+func (t *rf3Transport) driveUntilReady(tb testing.TB, label string, timeout time.Duration, nodes []*Replica, condition func() bool) {
+	t.driveUntilMode(tb, label, timeout, nodes, true, condition)
+}
+
+func (t *rf3Transport) driveUntilMode(tb testing.TB, label string, timeout time.Duration, nodes []*Replica, awaitReady bool, condition func() bool) {
+	tb.Helper()
+	deadline := time.Now().Add(timeout)
+	drives := 0
+	for {
+		if condition() {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			tb.Fatalf("RF3 %s condition not met after %d bounded drives in %s: %s", label, drives, timeout, t.diagnostics(nodes))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		beforeReady := t.readyCounts(nodes)
+		drives++
+		err := t.drive(ctx, nodes...)
+		cancel()
+		if err != nil {
+			tb.Fatalf("RF3 %s quiescence failed at drive %d: %v", label, drives, err)
+		}
+		if awaitReady {
+			ctx, cancel = context.WithTimeout(context.Background(), time.Until(deadline))
+			err = t.waitAnyReady(ctx, nodes, beforeReady)
+			cancel()
+			if err != nil {
+				tb.Fatalf("RF3 %s Ready completion failed at drive %d: %v (%s)", label, drives, err, t.diagnostics(nodes))
+			}
+		}
+		runtime.Gosched()
+	}
+}
+
+func (t *rf3Transport) driveSetup(tb testing.TB, nodes []*Replica) {
+	tb.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), maxRF3QuiescenceWait)
+	err := t.waitNodesReady(ctx, nodes)
+	cancel()
+	if err != nil {
+		tb.Fatalf("RF3 bootstrap Ready completion failed: %v (%s)", err, t.diagnostics(nodes))
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), maxRF3QuiescenceWait)
+	err = t.quiesce(ctx, nodes)
+	cancel()
+	if err != nil {
+		tb.Fatalf("RF3 bootstrap quiescence failed: %v", err)
+	}
 }
 
 func newRF3TestCluster(tb testing.TB) (*rf3Transport, []*Replica) {
@@ -211,7 +427,8 @@ func newRF3TestCluster(tb testing.TB) (*rf3Transport, []*Replica) {
 	peers := []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}}
 	nodes := make([]*Replica, 3)
 	for i := range nodes {
-		node, err := Open(Options{ID: uint64(i + 1), Dir: filepath.Join(tb.TempDir(), "node"), Peers: peers, Transport: transport, ElectionTick: 100, HeartbeatTick: 1})
+		id := uint64(i + 1)
+		node, err := Open(Options{ID: id, Dir: filepath.Join(tb.TempDir(), "node"), Peers: peers, Transport: transport, ElectionTick: 100, HeartbeatTick: 1, readyHook: func() { transport.signalReady(id) }})
 		if err != nil {
 			tb.Fatal(err)
 		}
@@ -228,24 +445,20 @@ func newRF3TestCluster(tb testing.TB) (*rf3Transport, []*Replica) {
 
 func TestDeterministicRF3CampaignWaitsForLeader(t *testing.T) {
 	transport, nodes := newRF3TestCluster(t)
-	for i := 0; i < 4; i++ {
-		transport.drive(nodes...)
-	}
+	transport.driveSetup(t, nodes)
 	if err := nodes[0].Campaign(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	transport.driveUntil(t, maxRF3ElectionDrives, nodes, func() bool { return nodes[0].Status().Leader == 1 })
+	transport.driveUntilReady(t, "leader election", maxRF3ConditionWait, nodes[:1], func() bool { return nodes[0].Status().Leader == 1 })
 }
 
 func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	transport, nodes := newRF3TestCluster(t)
-	for i := 0; i < 4; i++ {
-		transport.drive(nodes...)
-	}
+	transport.driveSetup(t, nodes)
 	if err := nodes[0].Campaign(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	transport.driveUntil(t, maxRF3ElectionDrives, nodes, func() bool { return nodes[0].Status().Leader == 1 })
+	transport.driveUntilReady(t, "leader election", maxRF3ConditionWait, nodes[:1], func() bool { return nodes[0].Status().Leader == 1 })
 	command, err := NewPut("users", "rf3", []byte(`{"n":1}`), storage.Condition{}, deterministicUUIDs())
 	if err != nil {
 		t.Fatal(err)
@@ -253,31 +466,38 @@ func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	transport.reverse = true
 	resultCh := make(chan error, 1)
 	go func() { _, err := nodes[0].Propose(context.Background(), command); resultCh <- err }()
-	for i := 0; i < 80; i++ {
-		transport.drive(nodes...)
+	var proposalErr error
+	transport.driveUntilReady(t, "proposal commit", maxRF3ConditionWait, nodes[:1], func() bool {
 		select {
-		case err := <-resultCh:
-			if err != nil {
-				t.Fatal(err)
-			}
-			goto committed
+		case proposalErr = <-resultCh:
+			return true
 		default:
+			return false
 		}
+	})
+	if proposalErr != nil {
+		t.Fatal(proposalErr)
 	}
-	t.Fatal("RF3 proposal did not commit")
-committed:
 	transport.setPartition(1, 2, true)
 	transport.setPartition(1, 3, true)
-	for i := 0; i < 20; i++ {
-		transport.drive(nodes[1], nodes[2])
-	}
+	partitionStart := transport.partitionTrafficCount()
+	transport.driveUntil(t, "partition", maxRF3ConditionWait, nodes[1:], func() bool {
+		return transport.partitionTrafficCount() > partitionStart
+	})
 	transport.setPartition(1, 2, false)
 	transport.setPartition(1, 3, false)
-	for i := 0; i < 40; i++ {
-		transport.drive(nodes...)
+	var retry Result
+	var retryOK bool
+	var retryErr error
+	transport.driveUntilReady(t, "follower retry lookup", maxRF3ConditionWait, nodes[:1], func() bool {
+		retry, retryOK, retryErr = nodes[1].LookupResult(command.OperationID)
+		return retryErr != nil || retryOK
+	})
+	if retryErr != nil || !retryOK {
+		t.Fatalf("follower retry lookup = %v, %v", retryOK, retryErr)
 	}
-	if _, ok, err := nodes[1].LookupResult(command.OperationID); err != nil || !ok {
-		t.Fatalf("follower retry lookup = %v, %v", ok, err)
+	if retry.Command.OperationID != command.OperationID || retry.Command.Table != command.Table || retry.Command.Key != command.Key || !bytes.Equal(retry.Command.Value, command.Value) || retry.Command.Version != command.Version || !retry.Succeeded() {
+		t.Fatalf("follower retry result = %#v, want successful command %#v", retry, command)
 	}
 	transport.reverse = false
 }
