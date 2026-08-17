@@ -497,13 +497,22 @@ func TestDeterministicRF3CampaignWaitsForLeader(t *testing.T) {
 func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	transport, nodes := newRF3TestCluster(t)
 	transport.driveSetup(t, nodes)
-	leaderReadyBeforeElection := transport.readyCount(nodes[0].id)
+	leaderAppliedBeforeElection := nodes[0].Status().Applied
 	if err := nodes[0].Campaign(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	transport.driveUntilReady(t, "leader election", maxRF3ConditionWait, nodes[:1], func() bool {
-		return nodes[0].Status().Leader == 1 && transport.readyCount(nodes[0].id) > leaderReadyBeforeElection
+		status := nodes[0].Status()
+		// The campaign no-op is applied only after the leader SoftState Ready
+		// has completed. Requiring Applied to advance therefore fences the
+		// admission epoch bump in observeSoftState; an earlier pre-vote or
+		// candidate Ready cannot satisfy this barrier.
+		return status.Leader == 1 && status.Applied > leaderAppliedBeforeElection
 	})
+	leaderAfterElection := nodes[0].Status()
+	if leaderAfterElection.Applied <= leaderAppliedBeforeElection {
+		t.Fatalf("RF3 leader admission barrier did not apply campaign no-op: before=%#v after=%#v", leaderAppliedBeforeElection, leaderAfterElection)
+	}
 	command, err := NewPut("users", "rf3", []byte(`{"n":1}`), storage.Condition{}, deterministicUUIDs())
 	if err != nil {
 		t.Fatal(err)
