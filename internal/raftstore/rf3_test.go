@@ -497,10 +497,13 @@ func TestDeterministicRF3CampaignWaitsForLeader(t *testing.T) {
 func TestDeterministicRF3PartitionReorderAndRetry(t *testing.T) {
 	transport, nodes := newRF3TestCluster(t)
 	transport.driveSetup(t, nodes)
+	leaderReadyBeforeElection := transport.readyCount(nodes[0].id)
 	if err := nodes[0].Campaign(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	transport.driveUntilReady(t, "leader election", maxRF3ConditionWait, nodes[:1], func() bool { return nodes[0].Status().Leader == 1 })
+	transport.driveUntilReady(t, "leader election", maxRF3ConditionWait, nodes[:1], func() bool {
+		return nodes[0].Status().Leader == 1 && transport.readyCount(nodes[0].id) > leaderReadyBeforeElection
+	})
 	command, err := NewPut("users", "rf3", []byte(`{"n":1}`), storage.Condition{}, deterministicUUIDs())
 	if err != nil {
 		t.Fatal(err)
